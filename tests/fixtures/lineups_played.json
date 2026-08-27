@@ -1,0 +1,45 @@
+{
+  "MatchID": 1703100,
+  "HomeTeamID": 4192,
+  "HomeTeam": "Täby FC (A)",
+  "HomeTeamShortName": "Täby FC",
+  "HomeTeamLogotypeUrl": null,
+  "AwayTeamID": 1977,
+  "AwayTeam": "Tungelsta IF (A)",
+  "AwayTeamShortName": "Tungelsta IF",
+  "AwayTeamLogotypeUrl": null,
+  "HomeTeamPlayers": [
+    {
+      "MatchPlayerID": 9001,
+      "PlayerID": 55001,
+      "Name": "Hemma Spelare 1",
+      "ShirtNo": "10",
+      "LicensedAssociationID": 99
+    }
+  ],
+  "AwayTeamPlayers": [
+    {
+      "MatchPlayerID": 9002,
+      "PlayerID": 490153,
+      "Name": "Theodor Landell",
+      "ShirtNo": "1",
+      "LicensedAssociationID": 258
+    },
+    {
+      "MatchPlayerID": 9003,
+      "PlayerID": 143653,
+      "Name": "Marvin Rickman",
+      "ShirtNo": "5",
+      "LicensedAssociationID": 258
+    },
+    {
+      "MatchPlayerID": 9004,
+      "PlayerID": 249533,
+      "Name": "Philip Wiss",
+      "ShirtNo": "6",
+      "LicensedAssociationID": 258
+    }
+  ],
+  "HomeTeamTeamPersons": [],
+  "AwayTeamTeamPersons": []
+}

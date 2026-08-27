@@ -1,0 +1,8 @@
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJJYmlzVXNlcklEIjo3MjAwMCwiQXBpRGVsYXlNaW51dGVzIjowLCJVc2VEZWZhdWx0UGVyc29uSW1hZ2UiOmZhbHNlLCJyb2xlIjoiUGFrZXQgMiIsIm5iZiI6MTc4Nzg0NTEyNywiZXhwIjoxNzg3ODQ2OTI3LCJpYXQiOjE3ODc4NDUxMjcsImlzcyI6ImFwaS5pbm5lYmFuZHkuc2UifQ.tA67yDQv5x5m0z8rMh9N4NDsmCvjYUeszLXkskgwMy4",
+  "accessTokenExpiration": "2026-08-27T18:08:47.5854816+02:00",
+  "apiRoot": "https://api.innebandy.se/v2/api/",
+  "statusCode": 200,
+  "reasonPhrase": null,
+  "facebookAppId": "289915069663150"
+}
