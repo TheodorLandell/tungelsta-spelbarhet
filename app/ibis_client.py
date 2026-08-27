@@ -68,10 +68,17 @@ class IBISCompetition(BaseModel):
     Matches: list[IBISMatch] = []
 
 
+class IBISSquadPlayer(BaseModel):
+    PlayerID: int
+    Name: str
+    ShirtNo: int | None = None
+
+
 class IBISTeam(BaseModel):
     TeamID: int
     Name: str
     Competitions: list[IBISCompetition] = []
+    Players: list[IBISSquadPlayer] = []
 
 
 class IBISLineups(BaseModel):

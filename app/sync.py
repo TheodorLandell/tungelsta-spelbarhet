@@ -17,6 +17,7 @@ from app.ibis_client import (
     IBISClient,
     IBISMatch,
     IBISMatchPlayer,
+    IBISSquadPlayer,
     IBISTeam,
     filter_series_competitions,
     get_team_players,
@@ -103,6 +104,23 @@ def _upsert_player(db: Session, p: IBISMatchPlayer, kickoff: datetime) -> None:
             existing.last_seen = kickoff
 
 
+def _upsert_squad_player(db: Session, p: IBISSquadPlayer, sync_at: datetime) -> None:
+    """Sparar en trupp-spelare som ännu inte förekommer i någon lineup."""
+    shirt = str(p.ShirtNo) if p.ShirtNo is not None else None
+    existing = db.get(Player, p.PlayerID)
+    if existing is None:
+        db.add(Player(
+            player_id=p.PlayerID,
+            name=p.Name,
+            shirt_no=shirt,
+            last_seen=sync_at,
+        ))
+    else:
+        existing.name = p.Name
+        if shirt is not None:
+            existing.shirt_no = shirt
+
+
 def _has_appearances(db: Session, match_id: int) -> bool:
     return db.scalars(
         select(Appearance.player_id)
@@ -149,6 +167,7 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
 
     try:
         for team_label, team_id in (("A", settings.team_a_id), ("B", settings.team_b_id)):
+            db.flush()  # gör föregående lags pending-objekt synliga för get()
             raw_team = client.fetch_team_raw(settings.season_id, team_id)
             team = IBISTeam.model_validate(raw_team)
 
@@ -186,6 +205,12 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
                     players = get_team_players(lineups, team_id)
                     kickoff = parse_kickoff(match.MatchDateTime).replace(tzinfo=None)
                     _save_appearances(db, match.MatchID, players, kickoff)
+
+            # Spara trupp-spelare från lagets Players[]-lista (även de utan matcher)
+            squad_at = _now_naive()
+            db.flush()  # gör match-fasens pending-objekt synliga för get()
+            for squad_player in team.Players:
+                _upsert_squad_player(db, squad_player, squad_at)
 
         log.ok = True
 

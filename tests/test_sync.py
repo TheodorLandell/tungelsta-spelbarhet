@@ -68,7 +68,11 @@ def make_match_dict(
     }
 
 
-def make_team_dict(team_id: int, match_dicts: list[dict]) -> dict:
+def make_team_dict(
+    team_id: int,
+    match_dicts: list[dict],
+    players: list[dict] | None = None,
+) -> dict:
     return {
         "TeamID": team_id,
         "Name": f"Lag {team_id}",
@@ -80,7 +84,12 @@ def make_team_dict(team_id: int, match_dicts: list[dict]) -> dict:
                 "Matches": match_dicts,
             }
         ],
+        "Players": players or [],
     }
+
+
+def make_squad_player_dict(player_id: int, name: str = "Trupp Spelare", shirt_no: int | None = 5) -> dict:
+    return {"PlayerID": player_id, "Name": name, "ShirtNo": shirt_no}
 
 
 def make_lineups_dict(
@@ -460,3 +469,47 @@ class TestRunSync:
         assert result.started_at is not None
         assert result.finished_at is not None
         assert result.log_id is not None
+
+    def test_trupp_spelare_fran_lagobjektet_sparas_for_bada_lag(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        squad_a = [make_squad_player_dict(101, "Spelare A-lag", 5)]
+        squad_b = [make_squad_player_dict(202, "Spelare B-lag", 9)]
+
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [], players=squad_a),
+            team_b_dict=make_team_dict(TEAM_B_ID, [], players=squad_b),
+        )
+
+        log = run_sync(db, client)
+
+        assert log.ok is True
+
+        p_a = db.get(Player, 101)
+        assert p_a is not None
+        assert p_a.name == "Spelare A-lag"
+        assert p_a.shirt_no == "5"
+
+        p_b = db.get(Player, 202)
+        assert p_b is not None
+        assert p_b.name == "Spelare B-lag"
+        assert p_b.shirt_no == "9"
+
+    def test_spelare_i_bada_lagen_ger_en_rad_med_trojnummer(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Spelare 77 finns i A-lagets trupp med tröjnummer och i B-lagets utan
+        squad_a = [make_squad_player_dict(77, "Pendel Spelare", 9)]
+        squad_b = [make_squad_player_dict(77, "Pendel Spelare", None)]
+
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [], players=squad_a),
+            team_b_dict=make_team_dict(TEAM_B_ID, [], players=squad_b),
+        )
+
+        log = run_sync(db, client)
+
+        assert log.ok is True
+        player = db.get(Player, 77)
+        assert player is not None
+        assert player.shirt_no == "9"
