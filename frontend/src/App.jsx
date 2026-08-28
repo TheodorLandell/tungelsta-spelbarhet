@@ -22,17 +22,87 @@ function Counter({ label, count, colorClass }) {
   )
 }
 
+function LoginForm({ onLogin }) {
+  const [pwd, setPwd] = useState('')
+  const [err, setErr] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  async function submit(e) {
+    e.preventDefault()
+    setBusy(true)
+    setErr(null)
+    const msg = await onLogin(pwd)
+    if (msg) setErr(msg)
+    setBusy(false)
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
+      <div className="w-full max-w-sm">
+        <h1 className="text-2xl font-bold text-gray-900 mb-1 text-center">
+          Tungelsta IF
+        </h1>
+        <p className="text-sm text-gray-500 mb-6 text-center">Spelbarhetskoll</p>
+        <form onSubmit={submit} className="space-y-4">
+          <div>
+            <label
+              className="block text-sm font-medium text-gray-700 mb-1"
+              htmlFor="pwd"
+            >
+              Lösenord
+            </label>
+            <input
+              id="pwd"
+              type="password"
+              value={pwd}
+              onChange={e => setPwd(e.target.value)}
+              autoFocus
+              autoComplete="current-password"
+              className="w-full rounded-xl border border-gray-300 px-4 py-3 text-base
+                         focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          {err && (
+            <div className="px-4 py-3 bg-red-50 border border-red-200 rounded-xl
+                            text-red-700 text-sm">
+              {err}
+            </div>
+          )}
+          <button
+            type="submit"
+            disabled={busy || !pwd}
+            className="w-full py-3 bg-blue-600 hover:bg-blue-700 active:bg-blue-800
+                       text-white rounded-xl text-sm font-semibold
+                       disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {busy ? 'Loggar in...' : 'Logga in'}
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
+  // null = kontrollerar session, false = ej inloggad, true = inloggad
+  const [authed, setAuthed] = useState(null)
   const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [error, setError] = useState(null)
+  const [editMode, setEditMode] = useState(false)
 
   async function fetchStatus() {
+    setLoading(true)
     try {
       const res = await fetch('/api/status')
+      if (res.status === 401) {
+        setAuthed(false)
+        return
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setData(await res.json())
+      setAuthed(true)
       setError(null)
     } catch {
       setError('Kunde inte hämta data. Prova igen.')
@@ -41,11 +111,30 @@ export default function App() {
     }
   }
 
+  async function handleLogin(password) {
+    const res = await fetch('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    })
+    if (res.ok) {
+      setAuthed(true)
+      fetchStatus()
+      return null
+    }
+    if (res.status === 401) return 'Fel lösenord. Försök igen.'
+    return 'Något gick fel. Försök igen.'
+  }
+
   async function handleSync() {
     setSyncing(true)
     setError(null)
     try {
       const res = await fetch('/api/sync', { method: 'POST' })
+      if (res.status === 401) {
+        setAuthed(false)
+        return
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       await fetchStatus()
     } catch {
@@ -55,14 +144,44 @@ export default function App() {
     }
   }
 
+  async function handleOverride(playerId, kind, value, note) {
+    try {
+      const res = await fetch('/api/overrides', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ player_id: playerId, kind, value, note }),
+      })
+      if (res.status === 401) { setAuthed(false); return }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await fetchStatus()
+    } catch {
+      setError('Kunde inte spara ändringen. Prova igen.')
+    }
+  }
+
+  async function handleReset(playerId) {
+    try {
+      const res = await fetch(`/api/overrides/${playerId}`, { method: 'DELETE' })
+      if (res.status === 401) { setAuthed(false); return }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await fetchStatus()
+    } catch {
+      setError('Kunde inte återställa. Prova igen.')
+    }
+  }
+
   useEffect(() => { fetchStatus() }, [])
 
-  if (loading) {
+  if (authed === null || (authed === true && loading && !data)) {
     return (
       <div className="min-h-screen flex items-center justify-center text-gray-500">
         Laddar...
       </div>
     )
+  }
+
+  if (authed === false) {
+    return <LoginForm onLogin={handleLogin} />
   }
 
   const r = data?.rakningar ?? {}
@@ -73,24 +192,38 @@ export default function App() {
     <div className="max-w-2xl mx-auto px-4 py-6 pb-16">
 
       {/* Header */}
-      <div className="mb-5">
-        <h1 className="text-2xl font-bold text-gray-900 leading-tight">
-          Tungelsta IF (B)
-        </h1>
-        <p className="text-sm text-gray-500 mt-1">
-          {data?.senaste_sync
-            ? `Senaste synk: ${formatDateTime(data.senaste_sync)}`
-            : 'Aldrig synkad'}
-        </p>
+      <div className="mb-5 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900 leading-tight">
+            Tungelsta IF (B)
+          </h1>
+          <p className="text-sm text-gray-500 mt-1">
+            {data?.senaste_sync
+              ? `Senaste synk: ${formatDateTime(data.senaste_sync)}`
+              : 'Aldrig synkad'}
+          </p>
+          <button
+            onClick={handleSync}
+            disabled={syncing}
+            className="mt-3 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800
+                       text-white rounded-xl text-sm font-semibold
+                       disabled:opacity-50 disabled:cursor-not-allowed
+                       transition-colors"
+          >
+            {syncing ? 'Uppdaterar...' : 'Uppdatera'}
+          </button>
+        </div>
+
         <button
-          onClick={handleSync}
-          disabled={syncing}
-          className="mt-3 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800
-                     text-white rounded-xl text-sm font-semibold
-                     disabled:opacity-50 disabled:cursor-not-allowed
-                     transition-colors"
+          onClick={() => setEditMode(m => !m)}
+          className={`shrink-0 mt-1 px-4 py-2.5 rounded-xl text-sm font-semibold
+                      transition-colors ${
+            editMode
+              ? 'bg-green-600 hover:bg-green-700 text-white'
+              : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-300'
+          }`}
         >
-          {syncing ? 'Uppdaterar...' : 'Uppdatera'}
+          {editMode ? 'Klar' : 'Redigera'}
         </button>
       </div>
 
@@ -148,18 +281,27 @@ export default function App() {
             title="Måste stå över nästa A-match"
             players={g.maste_sta_over}
             variant="must-sit"
+            editMode={editMode}
+            onOverride={handleOverride}
+            onReset={handleReset}
           />
         )}
         <PlayerGroup
           title="Tillgängliga"
           players={g.tillgangliga ?? []}
           variant="available"
+          editMode={editMode}
+          onOverride={handleOverride}
+          onReset={handleReset}
         />
         {(g.lasta ?? []).length > 0 && (
           <PlayerGroup
             title="Låsta i A-laget"
             players={g.lasta}
             variant="locked"
+            editMode={editMode}
+            onOverride={handleOverride}
+            onReset={handleReset}
           />
         )}
       </div>

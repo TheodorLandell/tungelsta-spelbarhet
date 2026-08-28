@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import app, get_db, _clear_status_cache
+from app.auth import require_session
 from app.models import Appearance, Base, Match, Player, SyncLog
 from app.sync import SyncResult
 
@@ -45,6 +46,7 @@ def db():
 @pytest.fixture
 def api_client(db):
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[require_session] = lambda: None
     yield TestClient(app)
     app.dependency_overrides.clear()
 

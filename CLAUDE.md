@@ -8,3 +8,7 @@
 - Hemligheter läses från miljövariabler. Aldrig i koden, aldrig i git.
 - Svenska i allt som användaren ser. Sentence case, inga utropstecken.
 - Bygg bara det steget jag ber om. Fråga innan du går vidare.
+- Felmeddelanden i UI måste spegla vad som faktiskt gick fel. Visa aldrig
+  ett specifikt fel (fel lösenord, synk misslyckades) när orsaken kan vara
+  ett nätverksfel eller ett annat statuskodsvar.
+  

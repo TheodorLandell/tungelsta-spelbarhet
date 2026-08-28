@@ -18,7 +18,7 @@ const GROUP_STYLES = {
   },
 }
 
-export default function PlayerGroup({ title, players, variant }) {
+export default function PlayerGroup({ title, players, variant, editMode, onOverride, onReset }) {
   const styles = GROUP_STYLES[variant]
 
   return (
@@ -33,7 +33,13 @@ export default function PlayerGroup({ title, players, variant }) {
           players.map((player, i) => (
             <div key={player.player_id}>
               <div className="px-4">
-                <PlayerRow player={player} variant={variant} />
+                <PlayerRow
+                  player={player}
+                  variant={variant}
+                  editMode={editMode}
+                  onOverride={onOverride}
+                  onReset={onReset}
+                />
               </div>
               {i < players.length - 1 && (
                 <div className={`border-t ${styles.divider}`} />
