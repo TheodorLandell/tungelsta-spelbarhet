@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import PlayerGroup from './components/PlayerGroup'
 import MatchesTab from './components/Matches'
+import StatsTab from './components/Stats'
 
 function formatDateTime(isoStr) {
   if (!isoStr) return null
@@ -50,6 +51,7 @@ function TeamSwitcher({ team, onChange }) {
 const VIEWS = [
   { id: 'spelbarhet', label: 'Spelbarhet' },
   { id: 'matcher', label: 'Matcher' },
+  { id: 'statistik', label: 'Statistik' },
 ]
 
 function ViewNav({ view, onChange }) {
@@ -274,6 +276,10 @@ export default function App() {
 
       {view === 'matcher' && (
         <MatchesTab team={team} onUnauthed={() => setAuthed(false)} />
+      )}
+
+      {view === 'statistik' && (
+        <StatsTab team={team} onUnauthed={() => setAuthed(false)} />
       )}
 
       {view === 'spelbarhet' && (

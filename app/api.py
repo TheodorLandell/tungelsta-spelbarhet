@@ -12,6 +12,7 @@ GET  /api/matches             – matchlista per lag
 GET  /api/matches/{id}        – matchvy med trupp
 GET  /api/matches/{id}/shot-events   – alla skotthändelser för en match
 POST /api/matches/{id}/shot-events   – ta emot en batch skotthändelser (idempotent på klient-UUID)
+GET  /api/stats               – statistik per spelare för ett lag och en omfattning
 POST /api/matches/{id}/roster-edits          – lägg till eller ta bort en spelare i matchens trupp
 DELETE /api/matches/{id}/roster-edits/{pid}  – ångra en tidigare ändring
 GET  /{path}                  – serverar byggt frontend (SPA-fallback)
@@ -47,6 +48,7 @@ from app.models import (
     ShotEvent,
     SyncLog,
 )
+from app.stats import SCOPES, compute_stats
 from app.status import get_statuses
 from app.sync import run_sync
 
@@ -815,6 +817,36 @@ def post_shot_events(
 
     db.commit()
     return {"sparade": sparade, "antal": len(sparade)}
+
+
+# ---------------------------------------------------------------------------
+# Statistik (steg 17) – SPEC 7
+#
+# Per spelare, för valt lag och vald omfattning. Lagseparationen ligger i att
+# team alltid anges: en spelare som spelat i båda lagen får sina A-siffror i
+# team=A och sina B-siffror i team=B.
+#
+#   scope=senaste     senaste spelade seriematchen
+#   scope=senaste_n   de senaste n spelade seriematcherna (n default 5)
+#   scope=sasong      hela säsongen
+# ---------------------------------------------------------------------------
+
+@app.get("/api/stats")
+def get_stats(
+    team: str,
+    scope: str = "sasong",
+    n: int = 5,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    if team not in ("A", "B"):
+        raise HTTPException(status_code=400, detail="team måste vara A eller B")
+    if scope not in SCOPES:
+        raise HTTPException(status_code=400, detail="Ogiltig omfattning")
+    if scope == "senaste_n" and n < 1:
+        raise HTTPException(status_code=400, detail="n måste vara minst 1")
+
+    return compute_stats(db, team, scope, n)
 
 
 # ---------------------------------------------------------------------------
