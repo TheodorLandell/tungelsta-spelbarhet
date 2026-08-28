@@ -28,6 +28,9 @@ class Appearance(Base):
     player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.player_id"), primary_key=True)
     player_name: Mapped[str] = mapped_column(String(128))
     shirt_no: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    goals: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    assists: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    penalty_minutes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     match: Mapped["Match"] = relationship(back_populates="appearances")
     player: Mapped["Player"] = relationship(back_populates="appearances")
@@ -39,10 +42,31 @@ class Player(Base):
     player_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128))
     shirt_no: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    is_goalkeeper: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     last_seen: Mapped[datetime] = mapped_column(DateTime)
 
     appearances: Mapped[list["Appearance"]] = relationship(back_populates="player")
     overrides: Mapped[list["Override"]] = relationship(back_populates="player")
+    teams: Mapped[list["PlayerTeam"]] = relationship(back_populates="player")
+
+
+class PlayerTeam(Base):
+    """
+    Lagtillhörighet per spelare. Många-till-många: sju spelare står i båda
+    lagens trupper. Fylls av synken som unionen av två källor:
+      - spelaren finns i lagets Players[] från teams-endpointen
+      - spelaren har en appearance i en match som tillhör laget
+    Används bara som filter i gränssnittet, aldrig av regelmotorn.
+    """
+
+    __tablename__ = "player_teams"
+
+    player_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("players.player_id"), primary_key=True
+    )
+    team: Mapped[str] = mapped_column(String(1), primary_key=True)  # 'A' | 'B'
+
+    player: Mapped["Player"] = relationship(back_populates="teams")
 
 
 class Override(Base):
@@ -50,8 +74,8 @@ class Override(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.player_id"))
-    kind: Mapped[str] = mapped_column(String(32))          # 'unlock' | 'set_matches_left'
-    value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kind: Mapped[str] = mapped_column(String(32))          # 'lock' | 'unlock' | 'set_matches_left'
+    value: Mapped[int | None] = mapped_column(Integer, nullable=True)  # null för lock/unlock
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime)
     created_by: Mapped[str] = mapped_column(Text)

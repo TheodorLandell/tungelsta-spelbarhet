@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import PlayerGroup from './components/PlayerGroup'
+import MatchesTab from './components/Matches'
 
 function formatDateTime(isoStr) {
   if (!isoStr) return null
@@ -11,6 +12,65 @@ function formatDateTime(isoStr) {
     hour: '2-digit',
     minute: '2-digit',
   })
+}
+
+const TEAMS = ['A', 'B']
+
+function loadTeam() {
+  try {
+    const saved = localStorage.getItem('lag')
+    if (TEAMS.includes(saved)) return saved
+  } catch {
+    // localStorage kan vara blockerad – fall tillbaka på standard
+  }
+  return 'B'
+}
+
+function TeamSwitcher({ team, onChange }) {
+  return (
+    <div className="inline-flex rounded-xl border border-gray-300 bg-gray-100 p-1">
+      {TEAMS.map(t => (
+        <button
+          key={t}
+          onClick={() => onChange(t)}
+          aria-pressed={team === t}
+          className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors ${
+            team === t
+              ? 'bg-white text-gray-900 shadow-sm'
+              : 'text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Lag {t}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+const VIEWS = [
+  { id: 'spelbarhet', label: 'Spelbarhet' },
+  { id: 'matcher', label: 'Matcher' },
+]
+
+function ViewNav({ view, onChange }) {
+  return (
+    <div className="flex gap-1 border-b border-gray-200">
+      {VIEWS.map(v => (
+        <button
+          key={v.id}
+          onClick={() => onChange(v.id)}
+          aria-current={view === v.id ? 'page' : undefined}
+          className={`px-4 py-2 text-sm font-semibold -mb-px border-b-2 transition-colors ${
+            view === v.id
+              ? 'border-blue-600 text-blue-700'
+              : 'border-transparent text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          {v.label}
+        </button>
+      ))}
+    </div>
+  )
 }
 
 function Counter({ label, count, colorClass }) {
@@ -91,11 +151,22 @@ export default function App() {
   const [syncing, setSyncing] = useState(false)
   const [error, setError] = useState(null)
   const [editMode, setEditMode] = useState(false)
+  const [team, setTeam] = useState(loadTeam)
+  const [view, setView] = useState('spelbarhet')
+
+  function changeTeam(t) {
+    setTeam(t)
+    try {
+      localStorage.setItem('lag', t)
+    } catch {
+      // localStorage kan vara blockerad – valet gäller ändå denna session
+    }
+  }
 
   async function fetchStatus() {
     setLoading(true)
     try {
-      const res = await fetch('/api/status')
+      const res = await fetch(`/api/status?team=${team}`)
       if (res.status === 401) {
         setAuthed(false)
         return
@@ -170,7 +241,7 @@ export default function App() {
     }
   }
 
-  useEffect(() => { fetchStatus() }, [])
+  useEffect(() => { fetchStatus() }, [team])
 
   if (authed === null || (authed === true && loading && !data)) {
     return (
@@ -191,11 +262,27 @@ export default function App() {
   return (
     <div className="max-w-2xl mx-auto px-4 py-6 pb-16">
 
+      {/* Lagväljare – gäller hela appen */}
+      <div className="mb-3">
+        <TeamSwitcher team={team} onChange={changeTeam} />
+      </div>
+
+      {/* Navigering mellan vyerna */}
+      <div className="mb-5">
+        <ViewNav view={view} onChange={setView} />
+      </div>
+
+      {view === 'matcher' && (
+        <MatchesTab team={team} onUnauthed={() => setAuthed(false)} />
+      )}
+
+      {view === 'spelbarhet' && (
+       <>
       {/* Header */}
       <div className="mb-5 flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 leading-tight">
-            Tungelsta IF (B)
+            Tungelsta IF ({team})
           </h1>
           <p className="text-sm text-gray-500 mt-1">
             {data?.senaste_sync
@@ -305,6 +392,8 @@ export default function App() {
           />
         )}
       </div>
+       </>
+      )}
     </div>
   )
 }

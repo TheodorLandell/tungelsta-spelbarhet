@@ -28,9 +28,10 @@ from app.auth import (
     require_session,
     verify_password,
 )
+from app.config import settings
 from app.database import SessionLocal
 from app.ibis_client import IBISClient
-from app.models import Match, Override, Player, SyncLog
+from app.models import Appearance, Match, Override, Player, PlayerTeam, SyncLog
 from app.status import get_statuses
 from app.sync import run_sync
 
@@ -102,6 +103,10 @@ def _build_status_response(db: Session) -> dict[str, Any]:
     statuses, engine_warnings = get_statuses(db)
     players_by_id = {p.player_id: p for p in db.scalars(select(Player)).all()}
 
+    teams_by_player: dict[int, list[str]] = {}
+    for pt in db.scalars(select(PlayerTeam)).all():
+        teams_by_player.setdefault(pt.player_id, []).append(pt.team)
+
     active_overrides: dict[int, Override] = {
         o.player_id: o for o in db.scalars(select(Override)).all()
     }
@@ -123,7 +128,11 @@ def _build_status_response(db: Session) -> dict[str, Any]:
 
         ovr = active_overrides.get(s.player_id)
         if ovr is not None:
-            if ovr.kind == "unlock":
+            if ovr.kind == "lock":
+                is_locked = True
+                lock_orsak = None
+                lock_datum = None
+            elif ovr.kind == "unlock":
                 is_locked = False
                 lock_orsak = None
                 lock_datum = None
@@ -143,6 +152,7 @@ def _build_status_response(db: Session) -> dict[str, Any]:
             "consecutive_a": s.consecutive_a,
             "a_match_ids": list(s.a_match_ids),
             "b_match_ids": list(s.b_match_ids),
+            "lag": sorted(teams_by_player.get(s.player_id, [])),
             "maste_spela_b_forst": False,
             "lock_orsak": lock_orsak,
             "lock_datum": lock_datum,
@@ -171,12 +181,15 @@ def _build_status_response(db: Session) -> dict[str, Any]:
                 "consecutive_a": 0,
                 "a_match_ids": [],
                 "b_match_ids": [],
+                "lag": sorted(teams_by_player.get(pid, [])),
                 "maste_spela_b_forst": True,
                 "lock_orsak": None,
                 "lock_datum": None,
                 "override": _override_info(ovr, latest_kickoff) if ovr else None,
             }
-            if matcher_kvar == 0:
+            if ovr is not None and ovr.kind == "lock":
+                locked.append(row)
+            elif matcher_kvar == 0:
                 must_sit.append(row)
             else:
                 available.append(row)
@@ -198,6 +211,22 @@ def _build_status_response(db: Session) -> dict[str, Any]:
             "tillgangliga": len(available),
             "lasta": len(locked),
         },
+    }
+
+
+def _filter_response_by_team(response: dict[str, Any], team: str) -> dict[str, Any]:
+    """
+    Filtrerar spelarlistan på lagtillhörighet (player_teams). Ett filter, inte
+    en behörighetsspärr: varningar och senaste synk lämnas orörda.
+    """
+    grupper = {
+        namn: [r for r in rader if team in r["lag"]]
+        for namn, rader in response["grupper"].items()
+    }
+    return {
+        **response,
+        "grupper": grupper,
+        "rakningar": {namn: len(rader) for namn, rader in grupper.items()},
     }
 
 
@@ -245,15 +274,20 @@ def post_logout(response: Response) -> dict:
 
 @app.get("/api/status")
 def get_status(
+    team: str | None = None,
     db: Session = Depends(get_db),
     _: None = Depends(require_session),
 ) -> dict:
+    if team is not None and team not in ("A", "B"):
+        raise HTTPException(status_code=400, detail="team måste vara A eller B")
+
     global _status_cache
     with _cache_lock:
-        if _status_cache is not None:
-            return _status_cache
-        _status_cache = _build_status_response(db)
-        return _status_cache
+        if _status_cache is None:
+            _status_cache = _build_status_response(db)
+        full = _status_cache
+
+    return _filter_response_by_team(full, team) if team else full
 
 
 @app.post("/api/sync")
@@ -295,11 +329,12 @@ def post_override(
     db: Session = Depends(get_db),
     _: None = Depends(require_session),
 ) -> dict:
-    if body.kind not in ("unlock", "set_matches_left"):
+    if body.kind not in ("lock", "unlock", "set_matches_left"):
         raise HTTPException(status_code=400, detail="Ogiltig kind")
     if body.kind == "set_matches_left" and body.value not in (0, 1, 2):
         raise HTTPException(status_code=400, detail="value måste vara 0, 1 eller 2")
 
+    value = body.value if body.kind == "set_matches_left" else None
     snapshot = _latest_played_kickoff(db) or datetime.now()
 
     for o in db.scalars(select(Override).where(Override.player_id == body.player_id)).all():
@@ -308,7 +343,7 @@ def post_override(
     db.add(Override(
         player_id=body.player_id,
         kind=body.kind,
-        value=body.value,
+        value=value,
         note=body.note,
         created_at=datetime.now(),
         created_by="admin",
@@ -330,6 +365,116 @@ def delete_override(
     db.commit()
     _clear_status_cache()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Matchlista och matchvy (skrivskyddad – steg 12)
+# ---------------------------------------------------------------------------
+
+def _team_id_for(team_label: str) -> int:
+    return settings.team_a_id if team_label == "A" else settings.team_b_id
+
+
+def _match_summary(m: Match) -> dict[str, Any]:
+    raw = m.raw or {}
+
+    home_id = raw.get("HomeTeamID")
+    hemma = None if home_id is None else home_id == _team_id_for(m.team)
+
+    hall = raw.get("MainVenue") or raw.get("Venue")
+    hall = hall.strip() if isinstance(hall, str) and hall.strip() else None
+
+    goals_home = raw.get("GoalsHomeTeam")
+    goals_away = raw.get("GoalsAwayTeam")
+    resultat = None
+    if m.status == "played" and goals_home is not None and goals_away is not None:
+        resultat = {"hemma": goals_home, "borta": goals_away}
+
+    return {
+        "match_id": m.match_id,
+        "kickoff": m.kickoff.isoformat(),
+        "motstandare": m.opponent,
+        "hemma": hemma,
+        "hall": hall,
+        "status": m.status,
+        "omgang": m.round_name,
+        "resultat": resultat,
+    }
+
+
+def _match_detail(db: Session, m: Match) -> dict[str, Any]:
+    data = _match_summary(m)
+    spelad = m.status == "played"
+
+    apps = db.scalars(
+        select(Appearance).where(Appearance.match_id == m.match_id)
+    ).all()
+
+    gk_ids: set[int] = set()
+    if apps:
+        gk_ids = {
+            p.player_id
+            for p in db.scalars(
+                select(Player).where(
+                    Player.player_id.in_([a.player_id for a in apps])
+                )
+            ).all()
+            if p.is_goalkeeper
+        }
+
+    trupp = [
+        {
+            "player_id": a.player_id,
+            "namn": a.player_name,
+            "trojnummer": a.shirt_no,
+            "malvakt": a.player_id in gk_ids,
+            "mal": a.goals if spelad else None,
+            "assist": a.assists if spelad else None,
+            "utvisningsminuter": a.penalty_minutes if spelad else None,
+        }
+        for a in apps
+    ]
+
+    def _sort_key(row: dict) -> tuple:
+        try:
+            nr = int(row["trojnummer"])
+        except (TypeError, ValueError):
+            nr = 9999
+        return (not row["malvakt"], nr, row["namn"] or "")
+
+    trupp.sort(key=_sort_key)
+
+    data["spelad"] = spelad
+    data["trupp_publicerad"] = len(trupp) > 0
+    data["trupp"] = trupp
+    return data
+
+
+@app.get("/api/matches")
+def get_matches(
+    team: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    if team not in ("A", "B"):
+        raise HTTPException(status_code=400, detail="team måste vara A eller B")
+
+    rows = db.scalars(
+        select(Match).where(Match.team == team).order_by(Match.kickoff)
+    ).all()
+    return {"matcher": [_match_summary(m) for m in rows]}
+
+
+@app.get("/api/matches/{match_id}")
+def get_match(
+    match_id: int,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    m = db.get(Match, match_id)
+    if m is None:
+        raise HTTPException(status_code=404, detail="Matchen finns inte")
+    return _match_detail(db, m)
 
 
 # ---------------------------------------------------------------------------

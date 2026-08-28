@@ -31,6 +31,11 @@ class IBISMatchPlayer(BaseModel):
     MatchPlayerID: int
     Name: str
     ShirtNo: str | None = None
+    Goals: int | None = None
+    Assists: int | None = None
+    PenaltyMinutes: int | None = None
+    PositionID: int | None = None
+    Position: str | None = None
     LicensedAssociationID: int | None = None
 
 
@@ -72,6 +77,8 @@ class IBISSquadPlayer(BaseModel):
     PlayerID: int
     Name: str
     ShirtNo: int | None = None
+    PositionID: int | None = None
+    Position: str | None = None
 
 
 class IBISTeam(BaseModel):
@@ -120,6 +127,21 @@ def is_played(match: IBISMatch) -> bool:
 def filter_series_competitions(team: IBISTeam) -> list[IBISCompetition]:
     """Returnerar bara tävlingar med CompetitionTypeID == 1 (seriematcher)."""
     return [c for c in team.Competitions if c.CompetitionTypeID == 1]
+
+
+# Kända målvaktsbeteckningar i Position-fältet. PositionID:s enum är
+# odokumenterad (lag-Players[] har 1 = Målvakt men lineups har inte bekräftat
+# samma värde), så målvakt avgörs på den läsbara texten. Saknas Position är
+# spelaren inte målvakt.
+_GOALKEEPER_POSITIONS = {"mv", "mål", "malvakt", "målvakt", "goalkeeper", "goalie", "gk", "g"}
+
+
+def is_goalkeeper_player(player: "IBISMatchPlayer | IBISSquadPlayer") -> bool:
+    """Avgör om en spelare är målvakt utifrån Position (lineup eller trupp)."""
+    pos = (player.Position or "").strip().lower()
+    if not pos:
+        return False
+    return pos in _GOALKEEPER_POSITIONS or "målvakt" in pos or "goalkeeper" in pos
 
 
 def get_team_players(lineups: IBISLineups, team_id: int) -> list[IBISMatchPlayer]:

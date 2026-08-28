@@ -15,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.api import app, get_db, _clear_status_cache
 from app.auth import require_session
-from app.models import Appearance, Base, Match, Player, SyncLog
+from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
 from app.sync import SyncResult
 
 
@@ -62,15 +62,41 @@ def add_match(db, match_id, team, kickoff, status="played"):
     ))
 
 
-def add_appearance(db, match_id, player_id, name="Testspelare"):
-    db.add(Appearance(match_id=match_id, player_id=player_id, player_name=name))
+def add_match_raw(db, match_id, team, kickoff, status="scheduled", *,
+                  home_team_id=1977, away_team_id=9999, venue="Tungelstahallen",
+                  goals_home=None, goals_away=None, round_name="Omgång 1",
+                  opponent="Motståndarna"):
+    db.add(Match(
+        match_id=match_id, team=team, competition_id=100,
+        kickoff=kickoff, status=status, round_name=round_name, opponent=opponent,
+        raw={
+            "HomeTeamID": home_team_id,
+            "AwayTeamID": away_team_id,
+            "MainVenue": venue,
+            "GoalsHomeTeam": goals_home,
+            "GoalsAwayTeam": goals_away,
+        },
+    ))
 
 
-def add_player(db, player_id, name="Spelare", shirt_no="9"):
+def add_appearance(db, match_id, player_id, name="Testspelare", *,
+                   shirt_no=None, goals=0, assists=0, penalty_minutes=0):
+    db.add(Appearance(
+        match_id=match_id, player_id=player_id, player_name=name,
+        shirt_no=shirt_no, goals=goals, assists=assists,
+        penalty_minutes=penalty_minutes,
+    ))
+
+
+def add_player(db, player_id, name="Spelare", shirt_no="9", is_goalkeeper=False):
     db.add(Player(
         player_id=player_id, name=name, shirt_no=shirt_no,
-        last_seen=datetime(2026, 1, 1),
+        is_goalkeeper=is_goalkeeper, last_seen=datetime(2026, 1, 1),
     ))
+
+
+def add_player_team(db, player_id, team):
+    db.add(PlayerTeam(player_id=player_id, team=team))
 
 
 def make_sync_result(ok=True, matches_added=0, warnings=None) -> SyncResult:
@@ -288,6 +314,61 @@ class TestGetStatus:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/status?team= – lagfilter
+# ---------------------------------------------------------------------------
+
+class TestTeamFilter:
+    def _seed(self, db):
+        # Tre truppspelare utan matcher → alla i tillgangliga
+        add_player(db, 1, "A-spelare")
+        add_player(db, 2, "B-spelare")
+        add_player(db, 3, "Pendlare")
+        add_player_team(db, 1, "A")
+        add_player_team(db, 2, "B")
+        add_player_team(db, 3, "A")
+        add_player_team(db, 3, "B")
+        db.flush()
+
+    def test_utan_param_visar_alla(self, db, api_client):
+        self._seed(db)
+        data = api_client.get("/api/status").json()
+        ids = {p["player_id"] for p in data["grupper"]["tillgangliga"]}
+        assert ids == {1, 2, 3}
+        assert data["rakningar"]["tillgangliga"] == 3
+
+    def test_team_a_filtrerar_bort_rena_b_spelare(self, db, api_client):
+        self._seed(db)
+        data = api_client.get("/api/status?team=A").json()
+        ids = {p["player_id"] for p in data["grupper"]["tillgangliga"]}
+        assert ids == {1, 3}
+        assert data["rakningar"]["tillgangliga"] == 2
+
+    def test_team_b_filtrerar_bort_rena_a_spelare(self, db, api_client):
+        self._seed(db)
+        data = api_client.get("/api/status?team=B").json()
+        ids = {p["player_id"] for p in data["grupper"]["tillgangliga"]}
+        assert ids == {2, 3}
+
+    def test_spelare_i_bada_lagen_visas_for_bada(self, db, api_client):
+        self._seed(db)
+        a = api_client.get("/api/status?team=A").json()
+        b = api_client.get("/api/status?team=B").json()
+        assert any(p["player_id"] == 3 for p in a["grupper"]["tillgangliga"])
+        assert any(p["player_id"] == 3 for p in b["grupper"]["tillgangliga"])
+
+    def test_ogiltig_team_ger_400(self, db, api_client):
+        self._seed(db)
+        res = api_client.get("/api/status?team=C")
+        assert res.status_code == 400
+
+    def test_row_innehaller_lag(self, db, api_client):
+        self._seed(db)
+        data = api_client.get("/api/status").json()
+        row = next(p for p in data["grupper"]["tillgangliga"] if p["player_id"] == 3)
+        assert row["lag"] == ["A", "B"]
+
+
+# ---------------------------------------------------------------------------
 # POST /api/sync
 # ---------------------------------------------------------------------------
 
@@ -343,3 +424,128 @@ class TestPostSync:
         data = response.json()
 
         assert "Avbruten match utan resultat" in data["varningar"]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/matches – matchlista per lag
+# ---------------------------------------------------------------------------
+
+class TestGetMatches:
+    def test_kraver_lag_och_returnerar_i_datumordning(self, db, api_client):
+        add_match_raw(db, 3, "B", datetime(2026, 10, 5, 15), opponent="Sist")
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), opponent="Först")
+        add_match_raw(db, 2, "B", datetime(2026, 9, 20, 14), opponent="Mitten")
+        add_match_raw(db, 9, "A", datetime(2026, 9, 2, 13), opponent="A-match")
+        db.flush()
+
+        data = api_client.get("/api/matches?team=B").json()
+
+        assert [m["match_id"] for m in data["matcher"]] == [1, 2, 3]
+        assert data["matcher"][0]["motstandare"] == "Först"
+
+    def test_utan_lag_ger_422(self, db, api_client):
+        assert api_client.get("/api/matches").status_code == 422
+
+    def test_ogiltigt_lag_ger_400(self, db, api_client):
+        assert api_client.get("/api/matches?team=C").status_code == 400
+
+    def test_hemma_borta_och_hall(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13),
+                      home_team_id=17541, away_team_id=9999, venue="Brandbergshallen")
+        add_match_raw(db, 2, "B", datetime(2026, 9, 8, 13),
+                      home_team_id=9999, away_team_id=17541, venue="Bortahallen")
+        db.flush()
+
+        matcher = {m["match_id"]: m for m in api_client.get("/api/matches?team=B").json()["matcher"]}
+
+        assert matcher[1]["hemma"] is True
+        assert matcher[1]["hall"] == "Brandbergshallen"
+        assert matcher[2]["hemma"] is False
+
+    def test_resultat_visas_bara_for_spelad_match(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="played",
+                      goals_home=5, goals_away=3)
+        add_match_raw(db, 2, "B", datetime(2026, 9, 8, 13), status="scheduled",
+                      goals_home=None, goals_away=None)
+        db.flush()
+
+        matcher = {m["match_id"]: m for m in api_client.get("/api/matches?team=B").json()["matcher"]}
+
+        assert matcher[1]["resultat"] == {"hemma": 5, "borta": 3}
+        assert matcher[2]["resultat"] is None
+
+    def test_installd_match_har_status_cancelled(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="cancelled")
+        db.flush()
+
+        data = api_client.get("/api/matches?team=B").json()
+        assert data["matcher"][0]["status"] == "cancelled"
+
+    def test_tom_raw_kraschar_inte(self, db, api_client):
+        add_match(db, 1, "B", datetime(2026, 9, 1, 13), status="scheduled")
+        db.flush()
+
+        data = api_client.get("/api/matches?team=B").json()
+        row = data["matcher"][0]
+        assert row["hemma"] is None
+        assert row["hall"] is None
+        assert row["resultat"] is None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/matches/{id} – matchvy med trupp
+# ---------------------------------------------------------------------------
+
+class TestGetMatch:
+    def test_okand_match_ger_404(self, db, api_client):
+        assert api_client.get("/api/matches/999").status_code == 404
+
+    def test_trupp_ej_publicerad_nar_appearances_saknas(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="scheduled")
+        db.flush()
+
+        data = api_client.get("/api/matches/1").json()
+        assert data["trupp_publicerad"] is False
+        assert data["trupp"] == []
+        assert data["spelad"] is False
+
+    def test_trupp_fran_appearances_med_malvakt_markerad(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="scheduled")
+        add_player(db, 10, "Utespelare", "7")
+        add_player(db, 11, "Målvakten", "1", is_goalkeeper=True)
+        add_appearance(db, 1, 10, "Utespelare", shirt_no="7")
+        add_appearance(db, 1, 11, "Målvakten", shirt_no="1")
+        db.flush()
+
+        data = api_client.get("/api/matches/1").json()
+
+        assert data["trupp_publicerad"] is True
+        # Målvakt först, sedan tröjnummerordning
+        assert [p["player_id"] for p in data["trupp"]] == [11, 10]
+        assert data["trupp"][0]["malvakt"] is True
+        assert data["trupp"][1]["malvakt"] is False
+
+    def test_statistik_bara_nar_matchen_ar_spelad(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="scheduled")
+        add_appearance(db, 1, 10, "Spelare", shirt_no="7", goals=2, assists=1,
+                       penalty_minutes=2)
+        db.flush()
+
+        row = api_client.get("/api/matches/1").json()["trupp"][0]
+        assert row["mal"] is None
+        assert row["assist"] is None
+        assert row["utvisningsminuter"] is None
+
+    def test_statistik_visas_for_spelad_match(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="played",
+                      goals_home=3, goals_away=1)
+        add_appearance(db, 1, 10, "Spelare", shirt_no="7", goals=2, assists=1,
+                       penalty_minutes=2)
+        db.flush()
+
+        data = api_client.get("/api/matches/1").json()
+        assert data["spelad"] is True
+        row = data["trupp"][0]
+        assert row["mal"] == 2
+        assert row["assist"] == 1
+        assert row["utvisningsminuter"] == 2

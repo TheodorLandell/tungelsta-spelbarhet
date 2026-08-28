@@ -21,10 +21,11 @@ from app.ibis_client import (
     IBISTeam,
     filter_series_competitions,
     get_team_players,
+    is_goalkeeper_player,
     is_played,
     parse_kickoff,
 )
-from app.models import Appearance, Base, Match, Player, SyncLog
+from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
 
 STOCKHOLM = timezone(timedelta(hours=2))
 
@@ -88,18 +89,26 @@ def _upsert_match(
 
 
 def _upsert_player(db: Session, p: IBISMatchPlayer, kickoff: datetime) -> None:
+    is_gk = is_goalkeeper_player(p)
+    has_position = bool((p.Position or "").strip())
     existing = db.get(Player, p.PlayerID)
     if existing is None:
         db.add(Player(
             player_id=p.PlayerID,
             name=p.Name,
             shirt_no=p.ShirtNo,
+            is_goalkeeper=is_gk,
             last_seen=kickoff,
         ))
     else:
         existing.name = p.Name
         if p.ShirtNo is not None:
             existing.shirt_no = p.ShirtNo
+        # Uppdatera bara målvaktsmarkeringen när lineupen faktiskt har
+        # positionsdata – annars skulle en tom position nolla en tidigare
+        # känd målvakt.
+        if has_position:
+            existing.is_goalkeeper = is_gk
         if kickoff > existing.last_seen:
             existing.last_seen = kickoff
 
@@ -107,18 +116,45 @@ def _upsert_player(db: Session, p: IBISMatchPlayer, kickoff: datetime) -> None:
 def _upsert_squad_player(db: Session, p: IBISSquadPlayer, sync_at: datetime) -> None:
     """Sparar en trupp-spelare som ännu inte förekommer i någon lineup."""
     shirt = str(p.ShirtNo) if p.ShirtNo is not None else None
+    is_gk = is_goalkeeper_player(p)
+    has_position = bool((p.Position or "").strip())
     existing = db.get(Player, p.PlayerID)
     if existing is None:
         db.add(Player(
             player_id=p.PlayerID,
             name=p.Name,
             shirt_no=shirt,
+            is_goalkeeper=is_gk,
             last_seen=sync_at,
         ))
     else:
         existing.name = p.Name
         if shirt is not None:
             existing.shirt_no = shirt
+        if has_position:
+            existing.is_goalkeeper = is_gk
+
+
+def _upsert_player_team(db: Session, player_id: int, team_label: str) -> None:
+    """Registrerar att en spelare hör till ett lag. Idempotent."""
+    if db.get(PlayerTeam, (player_id, team_label)) is None:
+        db.add(PlayerTeam(player_id=player_id, team=team_label))
+
+
+def _sync_player_teams(db: Session, team_label: str) -> None:
+    """
+    Fyller player_teams för ett lag som unionen av två källor:
+      - spelare med en appearance i en match som tillhör laget
+      - spelare i lagets Players[] (registreras separat i squad-loopen)
+    """
+    player_ids = db.scalars(
+        select(Appearance.player_id)
+        .join(Match, Match.match_id == Appearance.match_id)
+        .where(Match.team == team_label)
+        .distinct()
+    ).all()
+    for pid in player_ids:
+        _upsert_player_team(db, pid, team_label)
 
 
 def _has_appearances(db: Session, match_id: int) -> bool:
@@ -137,13 +173,25 @@ def _save_appearances(
 ) -> None:
     for p in players:
         _upsert_player(db, p, kickoff)
-        if db.get(Appearance, (match_id, p.PlayerID)) is None:
+        goals = p.Goals or 0
+        assists = p.Assists or 0
+        penalty_minutes = p.PenaltyMinutes or 0
+        existing = db.get(Appearance, (match_id, p.PlayerID))
+        if existing is None:
             db.add(Appearance(
                 match_id=match_id,
                 player_id=p.PlayerID,
                 player_name=p.Name,
                 shirt_no=p.ShirtNo,
+                goals=goals,
+                assists=assists,
+                penalty_minutes=penalty_minutes,
             ))
+        else:
+            # Befintlig appearance: uppdatera statistiken från iBIS.
+            existing.goals = goals
+            existing.assists = assists
+            existing.penalty_minutes = penalty_minutes
 
 
 def run_sync(db: Session, client: IBISClient) -> SyncResult:
@@ -197,8 +245,16 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
                     if not is_played(match):
                         continue
 
-                    # Hoppa över om appearances redan finns (färdigrapporterad match)
-                    if not is_new and _has_appearances(db, match.MatchID):
+                    # Färdigrapporterad match med sparade appearances hämtas
+                    # inte om (SPEC 3.5). En spelad men ännu inte
+                    # färdigrapporterad match hämtas om varje synk så att
+                    # Goals/Assists/PenaltyMinutes på befintliga appearances
+                    # hålls uppdaterade.
+                    if (
+                        not is_new
+                        and match.FinalResultCreatedTS
+                        and _has_appearances(db, match.MatchID)
+                    ):
                         continue
 
                     lineups = client.fetch_lineups(match.MatchID)
@@ -211,6 +267,11 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
             db.flush()  # gör match-fasens pending-objekt synliga för get()
             for squad_player in team.Players:
                 _upsert_squad_player(db, squad_player, squad_at)
+                _upsert_player_team(db, squad_player.PlayerID, team_label)
+
+            # Lagtillhörighet: unionen av trupp-listan (ovan) och spelade matcher
+            db.flush()
+            _sync_player_teams(db, team_label)
 
         log.ok = True
 

@@ -74,6 +74,13 @@ class TestPostOverride:
         assert res.status_code == 200
         assert res.json()["ok"] is True
 
+    def test_lock_ger_200(self, client, db):
+        add_player(db, 42, "Kalle")
+        db.flush()
+        res = client.post("/api/overrides", json={"player_id": 42, "kind": "lock", "note": "Avstängd"})
+        assert res.status_code == 200
+        assert res.json()["ok"] is True
+
     def test_ogiltigt_kind_ger_400(self, client):
         res = client.post("/api/overrides", json={"player_id": 42, "kind": "ogiltig", "note": "x"})
         assert res.status_code == 400
@@ -180,6 +187,47 @@ class TestOverrideISynas:
         client.post("/api/overrides", json={"player_id": 42, "kind": "set_matches_left", "value": 2, "note": "test"})
 
         res = client.get("/api/status").json()
+        assert any(p["player_id"] == 42 for p in res["grupper"]["tillgangliga"])
+
+    def test_lock_appliceras_pa_tillganglig_spelare(self, client, db):
+        add_match(db, 1, "B", datetime(2020, 1, 1))
+        add_player(db, 42, "Kalle")
+        add_appearance(db, 1, 42, "Kalle")
+        db.flush()
+
+        before = client.get("/api/status").json()
+        assert any(p["player_id"] == 42 for p in before["grupper"]["tillgangliga"])
+
+        client.post("/api/overrides", json={"player_id": 42, "kind": "lock", "note": "Avstängd i disciplinnämnd"})
+
+        res = client.get("/api/status").json()
+        lasta = res["grupper"]["lasta"]
+        player = next(p for p in lasta if p["player_id"] == 42)
+        assert player["lock_orsak"] is None
+        assert player["override"]["kind"] == "lock"
+        assert player["override"]["value"] is None
+        assert not any(p["player_id"] == 42 for p in res["grupper"]["tillgangliga"])
+
+    def test_lock_pa_spelare_utan_matcher(self, client, db):
+        add_player(db, 42, "Kalle")
+        db.flush()
+
+        client.post("/api/overrides", json={"player_id": 42, "kind": "lock", "note": "test"})
+
+        res = client.get("/api/status").json()
+        assert any(p["player_id"] == 42 for p in res["grupper"]["lasta"])
+
+    def test_lock_kan_aterstallas(self, client, db):
+        add_match(db, 1, "B", datetime(2020, 1, 1))
+        add_player(db, 42, "Kalle")
+        add_appearance(db, 1, 42, "Kalle")
+        db.flush()
+
+        client.post("/api/overrides", json={"player_id": 42, "kind": "lock", "note": "test"})
+        client.delete("/api/overrides/42")
+
+        res = client.get("/api/status").json()
+        assert not any(p["player_id"] == 42 for p in res["grupper"]["lasta"])
         assert any(p["player_id"] == 42 for p in res["grupper"]["tillgangliga"])
 
     def test_set_matches_left_lasar_upp_last_spelare(self, client, db):

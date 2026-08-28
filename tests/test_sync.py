@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ibis_client import IBISClient, IBISLineups, IBISTeam
-from app.models import Appearance, Base, Match, Player, SyncLog
+from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
 from app.sync import (
     SyncResult,
     _has_appearances,
@@ -110,12 +110,26 @@ def make_lineups_dict(
     }
 
 
-def make_player_dict(player_id: int, name: str = "Testspelare", shirt_no: str = "9") -> dict:
+def make_player_dict(
+    player_id: int,
+    name: str = "Testspelare",
+    shirt_no: str = "9",
+    goals=None,
+    assists=None,
+    penalty_minutes=None,
+    position=None,
+    position_id=None,
+) -> dict:
     return {
         "MatchPlayerID": player_id * 100,
         "PlayerID": player_id,
         "Name": name,
         "ShirtNo": shirt_no,
+        "Goals": goals,
+        "Assists": assists,
+        "PenaltyMinutes": penalty_minutes,
+        "Position": position,
+        "PositionID": position_id,
         "LicensedAssociationID": 258,
     }
 
@@ -513,3 +527,218 @@ class TestRunSync:
         player = db.get(Player, 77)
         assert player is not None
         assert player.shirt_no == "9"
+
+
+# ---------------------------------------------------------------------------
+# player_teams: lagtillhörighet som unionen av trupp-lista och appearances
+# ---------------------------------------------------------------------------
+
+class TestPlayerTeams:
+    def _teams(self, db, player_id: int) -> set[str]:
+        return set(db.scalars(
+            select(PlayerTeam.team).where(PlayerTeam.player_id == player_id)
+        ).all())
+
+    def test_truppspelare_far_lagtillhorighet(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [], players=[
+                make_squad_player_dict(101, "A-trupp", 5),
+            ]),
+        )
+        assert run_sync(db, client).ok is True
+
+        assert self._teams(db, 101) == {"A"}
+
+    def test_appearance_ger_lagtillhorighet_utan_truppista(self, db, monkeypatch):
+        """Andra källan: spelat för laget utan att stå i dess Players[]."""
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = make_match_dict(2100, away_team_id=TEAM_B_ID, goals_home=1, goals_away=2,
+                            final_result_ts="2020-01-15T21:00:00")
+        lineups = make_lineups_dict(2100, home_id=OTHER_ID, away_id=TEAM_B_ID,
+                                    away_players=[make_player_dict(60, "Inhoppare", "8")])
+        client = build_client(
+            team_b_dict=make_team_dict(TEAM_B_ID, [m], players=[]),
+            lineups_by_id={2100: lineups},
+        )
+        assert run_sync(db, client).ok is True
+
+        assert self._teams(db, 60) == {"B"}
+
+    def test_spelare_i_bada_lagen_far_bada_lagtillhorigheter(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Står i A:s trupp, men har bara spelat B-match
+        b_match = make_match_dict(2200, away_team_id=TEAM_B_ID, goals_home=0, goals_away=1,
+                                  final_result_ts="2020-02-01T21:00:00")
+        b_lineups = make_lineups_dict(2200, home_id=OTHER_ID, away_id=TEAM_B_ID,
+                                      away_players=[make_player_dict(77, "Pendlare", "9")])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [], players=[
+                make_squad_player_dict(77, "Pendlare", 9),
+            ]),
+            team_b_dict=make_team_dict(TEAM_B_ID, [b_match], players=[]),
+            lineups_by_id={2200: b_lineups},
+        )
+        assert run_sync(db, client).ok is True
+
+        assert self._teams(db, 77) == {"A", "B"}
+
+    def test_lagtillhorighet_ar_idempotent(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [], players=[
+                make_squad_player_dict(101, "A-trupp", 5),
+            ]),
+        )
+        run_sync(db, client)
+        run_sync(db, client)
+
+        rows = db.scalars(
+            select(PlayerTeam).where(PlayerTeam.player_id == 101)
+        ).all()
+        assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Steg 11: Goals/Assists/PenaltyMinutes på appearances + målvaktsmarkering
+# ---------------------------------------------------------------------------
+
+class TestAppearanceStats:
+    def _played_match(self, match_id: int) -> dict:
+        return make_match_dict(match_id, goals_home=3, goals_away=2,
+                               final_result_ts="2020-01-15T21:00:00")
+
+    def test_ny_appearance_far_statistik_fran_lineups(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._played_match(5001)
+        lineups = make_lineups_dict(5001, away_players=[
+            make_player_dict(42, "Kalle", "7", goals=2, assists=1, penalty_minutes=2),
+        ])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={5001: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+
+        app = db.get(Appearance, (5001, 42))
+        assert app.goals == 2
+        assert app.assists == 1
+        assert app.penalty_minutes == 2
+
+    def test_saknad_statistik_blir_noll(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._played_match(5002)
+        lineups = make_lineups_dict(5002, away_players=[make_player_dict(43)])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={5002: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+
+        app = db.get(Appearance, (5002, 43))
+        assert app.goals == 0
+        assert app.assists == 0
+        assert app.penalty_minutes == 0
+
+    def test_befintlig_appearance_uppdateras_vid_nasta_synk(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Match spelad men ännu inte färdigrapporterad, med en gammal
+        # appearance utan statistik.
+        db.add(Match(match_id=5003, team="A", competition_id=100,
+                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={}))
+        db.add(Player(player_id=44, name="Kalle", last_seen=datetime(2020, 1, 15, 19)))
+        db.add(Appearance(match_id=5003, player_id=44, player_name="Kalle"))
+        db.flush()
+
+        m = make_match_dict(5003, goals_home=2, goals_away=1)  # inget final_result_ts
+        lineups = make_lineups_dict(5003, away_players=[
+            make_player_dict(44, "Kalle", "7", goals=1, assists=2, penalty_minutes=0),
+        ])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={5003: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+
+        client.fetch_lineups.assert_called_once_with(5003)
+        app = db.get(Appearance, (5003, 44))
+        assert app.goals == 1
+        assert app.assists == 2
+
+    def test_fardigrapporterad_match_med_appearances_hamtas_inte_om(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        db.add(Match(match_id=5004, team="A", competition_id=100,
+                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={}))
+        db.add(Player(player_id=45, name="Kalle", last_seen=datetime(2020, 1, 15, 19)))
+        db.add(Appearance(match_id=5004, player_id=45, player_name="Kalle", goals=1))
+        db.flush()
+
+        m = self._played_match(5004)
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        assert run_sync(db, client).ok is True
+        client.fetch_lineups.assert_not_called()
+
+
+class TestGoalkeeperFlag:
+    def _played_match(self, match_id: int) -> dict:
+        return make_match_dict(match_id, goals_home=3, goals_away=2,
+                               final_result_ts="2020-01-15T21:00:00")
+
+    def test_position_malvakt_ger_is_goalkeeper(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._played_match(6001)
+        lineups = make_lineups_dict(6001, away_players=[
+            make_player_dict(50, "MV Svensson", "1", position="Målvakt"),
+        ])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={6001: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+        assert db.get(Player, 50).is_goalkeeper is True
+
+    def test_saknad_position_ger_false(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._played_match(6002)
+        lineups = make_lineups_dict(6002, away_players=[make_player_dict(51)])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={6002: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+        assert db.get(Player, 51).is_goalkeeper is False
+
+    def test_tom_position_nollar_inte_tidigare_markering(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        db.add(Player(player_id=52, name="MV Svensson", is_goalkeeper=True,
+                      last_seen=datetime(2019, 1, 1)))
+        db.flush()
+
+        m = self._played_match(6003)
+        lineups = make_lineups_dict(6003, away_players=[
+            make_player_dict(52, "MV Svensson", "1"),  # ingen position
+        ])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={6003: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+        assert db.get(Player, 52).is_goalkeeper is True

@@ -44,6 +44,9 @@ function Badge({ children, variant }) {
 
 function buildUnderlag(player, variant) {
   if (variant === 'locked') {
+    if (player.override?.kind === 'lock') {
+      return 'Låst manuellt'
+    }
     const reason = LOCK_REASON_HUMAN[player.lock_orsak] ?? player.lock_orsak ?? 'Okänd orsak'
     const date = formatDate(player.lock_datum)
     return date ? `${reason} – ${date}` : reason
@@ -160,8 +163,8 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
           {/* Redigeringskontroller (visas bara i redigeringsläge) */}
           {editMode && !pendingKind && (
             <div className="mt-2 flex flex-wrap gap-2 items-center">
-              {/* Lås upp – för låsta spelare */}
-              {isLocked && (
+              {/* Lås upp – för låsta spelare (ej när låsningen själv är en override) */}
+              {isLocked && ovr?.kind !== 'lock' && (
                 <button
                   onClick={() => { setPendingKind('unlock'); setPendingValue(null) }}
                   className="text-xs px-2.5 py-1 bg-blue-50 border border-blue-200
@@ -186,6 +189,17 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
                   {n} kvar
                 </button>
               ))}
+
+              {/* Lås – för olåsta spelare */}
+              {!isLocked && (
+                <button
+                  onClick={() => { setPendingKind('lock'); setPendingValue(null) }}
+                  className="text-xs px-2.5 py-1 bg-red-50 border border-red-200
+                             text-red-700 rounded-lg hover:bg-red-100 transition-colors"
+                >
+                  Lås
+                </button>
+              )}
 
               {/* Återställ – bara när override finns */}
               {ovr && (
