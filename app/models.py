@@ -89,6 +89,33 @@ class Override(Base):
     player: Mapped["Player"] = relationship(back_populates="overrides")
 
 
+class RosterEdit(Base):
+    """
+    Manuell ändring av en matchs trupp (SPEC 6.5). Ligger som ett lager ovanpå
+    iBIS-datan, som aldrig skrivs över.
+
+      - 'add'    lägger till en spelare i underlaget för matchen
+      - 'remove' tar bort en spelare som iBIS registrerat felaktigt
+
+    Ändringen påverkar både regelmotorn och skottregistreringens spelarlista,
+    eftersom syftet är att rätta fel i underlaget. Varje ändring kräver en
+    anteckning och går att ångra (raden raderas). Som overrides rör den aldrig
+    rådatan. Högst en aktiv rad per (match, spelare); en ny ersätter en tidigare.
+    """
+
+    __tablename__ = "roster_edits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    match_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("matches.match_id"), index=True
+    )
+    player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.player_id"))
+    action: Mapped[str] = mapped_column(String(8))          # 'add' | 'remove'
+    note: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    created_by: Mapped[str] = mapped_column(Text)
+
+
 class ShotEvent(Base):
     """
     Manuellt registrerade skott (SPEC 6.2–6.4). Primärnyckeln är ett UUID som

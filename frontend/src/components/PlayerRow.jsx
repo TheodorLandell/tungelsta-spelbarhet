@@ -160,6 +160,22 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
             </div>
           )}
 
+          {/* Manuellt ändrad matchlista – markeras som overrides (SPEC 6.5) */}
+          {player.roster_edit && !pendingKind && (
+            <p className="text-xs text-indigo-600 mt-1">
+              Underlaget manuellt ändrat:{' '}
+              {player.roster_edit.action === 'add'
+                ? 'spelare tillagd i en matchtrupp'
+                : 'spelare borttagen ur en matchtrupp'}
+              {' – '}
+              {player.roster_edit.note} ·{' '}
+              {formatOverrideDate(player.roster_edit.created_at)}
+              {player.roster_edit.antal > 1 &&
+                ` (+${player.roster_edit.antal - 1} till)`}
+              . Ändras i matchvyn.
+            </p>
+          )}
+
           {/* Redigeringskontroller (visas bara i redigeringsläge) */}
           {editMode && !pendingKind && (
             <div className="mt-2 flex flex-wrap gap-2 items-center">

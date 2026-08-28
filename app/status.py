@@ -22,15 +22,23 @@ from eligibility import (
 from app.database import SessionLocal, engine
 from app.models import Appearance as OrmAppearance
 from app.models import Base, Match as OrmMatch, Player as OrmPlayer
+from app.roster import apply_roster_edits, roster_edits_for_matches
 
 
-def get_statuses(db: Session) -> tuple[dict[int, PlayerStatus], list[str]]:
+def get_statuses(
+    db: Session, *, apply_edits: bool = True
+) -> tuple[dict[int, PlayerStatus], list[str]]:
     """
     Läser matcher och appearances ur databasen och kör regelmotorn.
 
     Endast matcher med counts_for_rules == True skickas in. Cup- och
     träningsmatcher (och deras appearances) filtreras bort helt – de får aldrig
-    påverka kvalificeringsregeln eller kedjeregeln.
+    påverka kvalificeringsregeln eller kedjeregeln. Detsamma gäller en
+    roster_edit på en sådan match: den matchen finns inte i counting_ids och
+    kan därför inte påverka reglerna.
+
+    apply_edits=False kör motorn på enbart iBIS-datan, utan roster_edits. Används
+    för att avgöra vilka spelare en roster_edit faktiskt påverkat.
     """
     orm_matches = db.scalars(
         select(OrmMatch).where(OrmMatch.counts_for_rules.is_(True))
@@ -41,6 +49,16 @@ def get_statuses(db: Session) -> tuple[dict[int, PlayerStatus], list[str]]:
         for a in db.scalars(select(OrmAppearance)).all()
         if a.match_id in counting_ids
     ]
+
+    base = [(a.match_id, a.player_id, a.player_name) for a in orm_appearances]
+    if apply_edits:
+        edits = roster_edits_for_matches(db, counting_ids)
+        player_names = {
+            p.player_id: p.name for p in db.scalars(select(OrmPlayer)).all()
+        }
+        effective = apply_roster_edits(base, edits, player_names)
+    else:
+        effective = base
 
     elig_matches = [
         EligMatch(
@@ -54,11 +72,11 @@ def get_statuses(db: Session) -> tuple[dict[int, PlayerStatus], list[str]]:
 
     elig_appearances = [
         EligAppearance(
-            match_id=a.match_id,
-            player_id=a.player_id,
-            player_name=a.player_name,
+            match_id=match_id,
+            player_id=player_id,
+            player_name=player_name,
         )
-        for a in orm_appearances
+        for (match_id, player_id, player_name) in effective
     ]
 
     return compute_statuses(elig_matches, elig_appearances)

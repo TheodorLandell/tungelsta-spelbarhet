@@ -135,6 +135,25 @@ export async function tombstoneLatest({ matchId, playerId, kind, period }) {
   return updated
 }
 
+// Ångrar den allra senaste aktiva registreringen i matchen, oavsett spelare,
+// kategori och period. Driver den kompakta ångra-knappen i registreringsvyn.
+// Som all borttagning: en tombstone, ingen rad raderas.
+export async function tombstoneMostRecent(matchId) {
+  const events = await loadEvents(matchId)
+  const active = events
+    .filter(e => !e.deleted_at)
+    .sort((a, b) => a.created_at.localeCompare(b.created_at))
+
+  const target = active[active.length - 1]
+  if (!target) return null
+
+  const updated = { ...target, deleted_at: new Date().toISOString(), synced_at: null }
+  const db = await openDb()
+  const store = tx(db, STORE_EVENTS, 'readwrite')
+  await toPromise(store.put(updated))
+  return updated
+}
+
 // Osynkade händelser (synced_at saknas) för en match.
 export async function unsyncedEvents(matchId) {
   const events = await loadEvents(matchId)

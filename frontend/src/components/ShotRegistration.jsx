@@ -6,6 +6,7 @@ import {
   loadEvents,
   addEvent,
   tombstoneLatest,
+  tombstoneMostRecent,
   countActive,
   canRegisterInPeriod,
   unsyncedCount,
@@ -255,27 +256,26 @@ function SyncStatusRow({ syncState, osynkade, online }) {
 }
 
 // ---------------------------------------------------------------------------
-// Flödesrad – de senaste registreringarna och vem som tryckte (SPEC 6.4)
+// Senaste registreringen – en kompakt rad med ångra (SPEC 6.4)
 // ---------------------------------------------------------------------------
 
-function Feed({ rows }) {
-  if (rows.length === 0) return null
+function LastRegistration({ row, onUndo }) {
+  if (!row) return null
   return (
-    <div className="mt-3 border border-gray-200 rounded-xl bg-white overflow-hidden">
-      <div className="px-3 py-1.5 bg-gray-50 text-[11px] font-semibold uppercase
-                      tracking-wide text-gray-500">
-        Senaste registreringar
-      </div>
-      <ul className="divide-y divide-gray-100 max-h-44 overflow-y-auto">
-        {rows.map(r => (
-          <li key={r.id} className="px-3 py-1.5 text-xs flex items-center gap-2">
-            <span className="font-medium text-gray-900 truncate">{r.namn}</span>
-            <span className="text-gray-500 shrink-0">{r.kategori}</span>
-            <span className="text-gray-400 shrink-0">P{r.period}</span>
-            <span className="ml-auto text-gray-400 shrink-0">{r.av}</span>
-          </li>
-        ))}
-      </ul>
+    <div className="mt-2 flex items-center gap-2 text-xs border border-gray-200
+                    rounded-lg bg-white px-3 py-1.5">
+      <span className="text-gray-400 shrink-0">Senast</span>
+      <span className="font-medium text-gray-900 truncate">{row.namn}</span>
+      <span className="text-gray-500 shrink-0">{row.kategori}</span>
+      <span className="text-gray-400 shrink-0">{row.av}</span>
+      <button
+        onClick={onUndo}
+        className="ml-auto shrink-0 px-2 py-0.5 rounded-md bg-gray-100 hover:bg-gray-200
+                   active:bg-gray-300 text-gray-700 font-semibold transition-colors
+                   touch-manipulation"
+      >
+        Ångra
+      </button>
     </div>
   )
 }
@@ -290,12 +290,10 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
 
   const [events, setEvents] = useState(null)
   const [period, setPeriod] = useState(1)
-  const [periodNotice, setPeriodNotice] = useState(false)
   const [name, setName] = useState(loadName)
   const [loadError, setLoadError] = useState(false)
   const [syncState, setSyncState] = useState('idle') // idle|syncing|synced|offline|error
   const [online, setOnline] = useState(isOnline)
-  const noticeTimer = useRef(null)
   const syncingRef = useRef(false)
   const eventsReadyRef = useRef(false)
   const runSyncRef = useRef(() => {})
@@ -321,8 +319,6 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
       alive = false
     }
   }, [matchId])
-
-  useEffect(() => () => clearTimeout(noticeTimer.current), [])
 
   // Läser om händelserna ur IndexedDB efter en synk – plockar upp andra
   // tränares registreringar och synced_at-stämplar.
@@ -386,18 +382,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
     }
   }, [runSync, loadError])
 
-  const changePeriod = useCallback(p => {
-    setPeriod(p)
-    if (!canRegisterInPeriod(p)) {
-      // Matchöversikten är skrivskyddad – ingen påminnelse om periodbyte.
-      setPeriodNotice(false)
-      clearTimeout(noticeTimer.current)
-      return
-    }
-    setPeriodNotice(true)
-    clearTimeout(noticeTimer.current)
-    noticeTimer.current = setTimeout(() => setPeriodNotice(false), 4000)
-  }, [])
+  const changePeriod = useCallback(p => setPeriod(p), [])
 
   const saveName = useCallback(n => {
     try {
@@ -447,6 +432,21 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
     [matchId, period, runSync],
   )
 
+  // Ångrar den allra senaste registreringen, oavsett spelare och period.
+  const handleUndoLast = useCallback(async () => {
+    try {
+      const updated = await tombstoneMostRecent(matchId)
+      if (updated) {
+        setEvents(prev =>
+          (prev ?? []).map(e => (e.id === updated.id ? updated : e)),
+        )
+        runSync()
+      }
+    } catch {
+      setLoadError(true)
+    }
+  }, [matchId, runSync])
+
   if (loadError) {
     return (
       <div className="border border-red-200 bg-red-50 rounded-xl px-4 py-6
@@ -471,12 +471,12 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
   const osynkade = unsyncedCount(events)
   const malById = new Map(trupp.map(p => [p.player_id, p.mal]))
   const namesById = new Map(trupp.map(p => [p.player_id, p.namn]))
-  const feed = feedRows(events, namesById)
+  const lastReg = feedRows(events, namesById, 1)[0] ?? null
 
   return (
     <div>
       {/* Statusrad: speglar vad synken faktiskt gör */}
-      <div className="mb-3 space-y-2">
+      <div className="mb-2 space-y-1.5">
         <SyncStatusRow syncState={syncState} osynkade={osynkade} online={online} />
         {offlineNotice && (
           <div className="flex items-center gap-2 text-xs text-gray-600
@@ -490,7 +490,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
       {/* Kortnamn krävs för att registrera */}
       {!name && <NamePrompt current={name} onSave={saveName} />}
       {name && (
-        <p className="text-xs text-gray-400 mb-3">
+        <p className="text-xs text-gray-400 mb-2">
           Registrerar som {name} ·{' '}
           <button
             onClick={() => setName(null)}
@@ -509,7 +509,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
               key={p}
               onClick={() => changePeriod(p)}
               aria-pressed={period === p}
-              className={`flex-1 h-12 rounded-xl text-base font-bold transition-colors
+              className={`flex-1 h-11 rounded-xl text-base font-bold transition-colors
                           select-none touch-manipulation ${
                             period === p
                               ? 'bg-blue-600 text-white ring-2 ring-blue-600 ring-offset-1'
@@ -519,50 +519,40 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
               P{p}
             </button>
           ))}
+          {/* Fjärde valet: skrivskyddad översikt över hela matchen */}
+          <button
+            onClick={() => changePeriod(OVERVIEW)}
+            aria-pressed={overview}
+            className={`flex-1 h-11 rounded-xl text-xs font-bold transition-colors
+                        select-none touch-manipulation ${
+                          overview
+                            ? 'bg-slate-700 text-white ring-2 ring-slate-700 ring-offset-1'
+                            : 'bg-white text-gray-500 border border-dashed border-gray-300 hover:border-slate-400'
+                        }`}
+          >
+            Hela matchen
+          </button>
         </div>
 
-        {/* Fjärde valet: skrivskyddad översikt över hela matchen */}
-        <button
-          onClick={() => changePeriod(OVERVIEW)}
-          aria-pressed={overview}
-          className={`mt-2 w-full h-11 rounded-xl text-sm font-bold transition-colors
-                      select-none touch-manipulation ${
-                        overview
-                          ? 'bg-slate-700 text-white ring-2 ring-slate-700 ring-offset-1'
-                          : 'bg-white text-gray-500 border border-dashed border-gray-300 hover:border-slate-400'
-                      }`}
-        >
-          Hela matchen
-        </button>
-
         {overview ? (
-          <p className="text-xs text-slate-700 bg-slate-100 border border-slate-300
-                        rounded-lg px-3 py-2 mt-2">
-            Översikt över hela matchen. Siffrorna är summan av alla perioder. Det
-            går inte att registrera här – välj P1, P2 eller P3.
+          <p className="text-xs text-slate-700 mt-1.5">
+            Översikt över hela matchen, skrivskyddad. Välj P1, P2 eller P3 för att
+            registrera.
           </p>
         ) : (
-          <>
-            <p className="text-xs text-gray-500 mt-1.5">
-              Tryck som görs nu sparas som{' '}
-              <span className="font-semibold text-gray-700">period {period}</span>.
-            </p>
-            {periodNotice && (
-              <p className="text-xs text-blue-700 bg-blue-50 border border-blue-200
-                            rounded-lg px-3 py-2 mt-1.5">
-                Period {period} vald. Kom ihåg att byta period när matchen går vidare.
-              </p>
-            )}
-          </>
+          <p className="text-xs text-gray-500 mt-1.5">
+            Tryck sparas som{' '}
+            <span className="font-semibold text-gray-700">period {period}</span>.
+          </p>
         )}
       </div>
 
-      {/* Flödesrad – vad andra tränare har registrerat */}
-      <Feed rows={feed} />
+      {/* Senaste registreringen – kompakt, med ångra */}
+      {!overview && <LastRegistration row={lastReg} onUndo={handleUndoLast} />}
 
       {/* Spelarlista */}
       <div className={`border rounded-xl bg-white divide-y divide-gray-100
-                      overflow-hidden mt-3 ${
+                      overflow-hidden mt-2 ${
                         overview ? 'border-slate-300' : 'border-gray-200'
                       }`}>
         {overview && (
@@ -586,12 +576,9 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
         ))}
       </div>
 
-      <p className="text-xs text-gray-400 mt-3 leading-relaxed">
-        Mål registreras inte manuellt – de hämtas från iBIS efter matchen.
-        Totala skott = mål + på mål + utanför + i täck och räknas fram.
-        Siffran på plusknappen gäller vald period. Totalt räknar alla perioder.
-        <span className="text-amber-500">*</span> betyder att målen ännu inte
-        är hämtade, så totalen är preliminär.
+      <p className="text-xs text-gray-400 mt-2">
+        Mål hämtas från iBIS. <span className="text-amber-500">*</span> = ännu
+        inte hämtade, totalen preliminär.
       </p>
     </div>
   )

@@ -12,6 +12,8 @@ GET  /api/matches             – matchlista per lag
 GET  /api/matches/{id}        – matchvy med trupp
 GET  /api/matches/{id}/shot-events   – alla skotthändelser för en match
 POST /api/matches/{id}/shot-events   – ta emot en batch skotthändelser (idempotent på klient-UUID)
+POST /api/matches/{id}/roster-edits          – lägg till eller ta bort en spelare i matchens trupp
+DELETE /api/matches/{id}/roster-edits/{pid}  – ångra en tidigare ändring
 GET  /{path}                  – serverar byggt frontend (SPA-fallback)
 """
 
@@ -41,6 +43,7 @@ from app.models import (
     Override,
     Player,
     PlayerTeam,
+    RosterEdit,
     ShotEvent,
     SyncLog,
 )
@@ -111,6 +114,17 @@ def _override_info(o: Override, latest_kickoff: datetime | None) -> dict:
     }
 
 
+def _roster_edit_info(edits: list[RosterEdit]) -> dict:
+    """Sammanfattning för del 1: senaste ändringen plus antal om det är flera."""
+    latest = max(edits, key=lambda e: (e.created_at, e.id))
+    return {
+        "action": latest.action,
+        "note": latest.note,
+        "created_at": latest.created_at.isoformat(),
+        "antal": len(edits),
+    }
+
+
 def _build_status_response(db: Session) -> dict[str, Any]:
     statuses, engine_warnings = get_statuses(db)
     players_by_id = {p.player_id: p for p in db.scalars(select(Player)).all()}
@@ -123,6 +137,41 @@ def _build_status_response(db: Session) -> dict[str, Any]:
         o.player_id: o for o in db.scalars(select(Override)).all()
     }
     latest_kickoff = _latest_played_kickoff(db)
+
+    # Roster edits på matcher som räknas i reglerna. En sådan ändring kan bara
+    # påverka den redigerade spelaren själv: kedjan räknas per spelare, och att
+    # lägga till eller ta bort en spelare i en trupp rör ingen annans
+    # appearances. En edit på en match med counts_for_rules = False finns inte
+    # bland counting_match_ids och kan därför aldrig markera någon.
+    counting_match_ids = {
+        m.match_id
+        for m in db.scalars(select(Match).where(Match.counts_for_rules.is_(True))).all()
+    }
+    roster_edits_by_player: dict[int, list[RosterEdit]] = {}
+    for e in db.scalars(select(RosterEdit)).all():
+        if e.match_id in counting_match_ids:
+            roster_edits_by_player.setdefault(e.player_id, []).append(e)
+
+    roster_affected: set[int] = set()
+    if roster_edits_by_player:
+        raw_statuses, _ = get_statuses(db, apply_edits=False)
+
+        def _sig(src: dict[int, Any], pid: int):
+            s = src.get(pid)
+            return (
+                None
+                if s is None
+                else (s.locked, s.lock_reason, s.matches_left, s.consecutive_a)
+            )
+
+        for pid in roster_edits_by_player:
+            if _sig(statuses, pid) != _sig(raw_statuses, pid):
+                roster_affected.add(pid)
+
+    def _roster_cell(pid: int) -> dict | None:
+        if pid not in roster_affected:
+            return None
+        return _roster_edit_info(roster_edits_by_player[pid])
 
     must_sit: list[dict] = []
     available: list[dict] = []
@@ -169,6 +218,7 @@ def _build_status_response(db: Session) -> dict[str, Any]:
             "lock_orsak": lock_orsak,
             "lock_datum": lock_datum,
             "override": _override_info(ovr, latest_kickoff) if ovr else None,
+            "roster_edit": _roster_cell(s.player_id),
         }
         if is_locked:
             locked.append(row)
@@ -198,6 +248,7 @@ def _build_status_response(db: Session) -> dict[str, Any]:
                 "lock_orsak": None,
                 "lock_datum": None,
                 "override": _override_info(ovr, latest_kickoff) if ovr else None,
+                "roster_edit": _roster_cell(pid),
             }
             if ovr is not None and ovr.kind == "lock":
                 locked.append(row)
@@ -424,38 +475,87 @@ def _match_summary(m: Match) -> dict[str, Any]:
     }
 
 
+def _roster_edit_cell(e: RosterEdit) -> dict[str, Any]:
+    return {
+        "action": e.action,
+        "note": e.note,
+        "created_at": e.created_at.isoformat(),
+        "created_by": e.created_by,
+    }
+
+
 def _match_detail(db: Session, m: Match) -> dict[str, Any]:
     data = _match_summary(m)
     spelad = m.status == "played"
 
-    apps = db.scalars(
-        select(Appearance).where(Appearance.match_id == m.match_id)
-    ).all()
+    apps = {
+        a.player_id: a
+        for a in db.scalars(
+            select(Appearance).where(Appearance.match_id == m.match_id)
+        ).all()
+    }
 
-    gk_ids: set[int] = set()
-    if apps:
-        gk_ids = {
-            p.player_id
-            for p in db.scalars(
-                select(Player).where(
-                    Player.player_id.in_([a.player_id for a in apps])
-                )
-            ).all()
-            if p.is_goalkeeper
-        }
+    # Roster edits ligger som ett lager ovanpå iBIS (SPEC 6.5). En borttagen
+    # spelare försvinner ur listan, en tillagd läggs till. Slår igenom på både
+    # skottregistreringen (den här listan) och regelmotorn.
+    edits = {
+        e.player_id: e
+        for e in db.scalars(
+            select(RosterEdit)
+            .where(RosterEdit.match_id == m.match_id)
+            .order_by(RosterEdit.created_at, RosterEdit.id)
+        ).all()
+    }
+    removed_ids = {pid for pid, e in edits.items() if e.action == "remove"}
+    added_ids = {pid for pid, e in edits.items() if e.action == "add"}
+    effective_ids = (set(apps) - removed_ids) | added_ids
 
-    trupp = [
+    need_ids = effective_ids | removed_ids
+    players_by_id = (
         {
-            "player_id": a.player_id,
-            "namn": a.player_name,
-            "trojnummer": a.shirt_no,
-            "malvakt": a.player_id in gk_ids,
-            "mal": a.goals if spelad else None,
-            "assist": a.assists if spelad else None,
-            "utvisningsminuter": a.penalty_minutes if spelad else None,
+            p.player_id: p
+            for p in db.scalars(
+                select(Player).where(Player.player_id.in_(need_ids))
+            ).all()
         }
-        for a in apps
-    ]
+        if need_ids
+        else {}
+    )
+
+    def _name(pid: int) -> str:
+        a = apps.get(pid)
+        if a is not None:
+            return a.player_name
+        p = players_by_id.get(pid)
+        return p.name if p is not None else f"Spelare {pid}"
+
+    def _shirt(pid: int) -> str | None:
+        a = apps.get(pid)
+        if a is not None:
+            return a.shirt_no
+        p = players_by_id.get(pid)
+        return p.shirt_no if p is not None else None
+
+    def _is_gk(pid: int) -> bool:
+        p = players_by_id.get(pid)
+        return bool(p.is_goalkeeper) if p is not None else False
+
+    trupp = []
+    for pid in effective_ids:
+        a = apps.get(pid)  # None för en tillagd spelare utan iBIS-appearance
+        e = edits.get(pid)
+        trupp.append({
+            "player_id": pid,
+            "namn": _name(pid),
+            "trojnummer": _shirt(pid),
+            "malvakt": _is_gk(pid),
+            "mal": a.goals if (spelad and a is not None) else None,
+            "assist": a.assists if (spelad and a is not None) else None,
+            "utvisningsminuter": (
+                a.penalty_minutes if (spelad and a is not None) else None
+            ),
+            "roster_edit": _roster_edit_cell(e) if e is not None else None,
+        })
 
     def _sort_key(row: dict) -> tuple:
         try:
@@ -466,9 +566,46 @@ def _match_detail(db: Session, m: Match) -> dict[str, Any]:
 
     trupp.sort(key=_sort_key)
 
+    # Borttagna spelare visas separat i redigeringsläget med en återställ-knapp.
+    borttagna = sorted(
+        (
+            {
+                "player_id": pid,
+                "namn": _name(pid),
+                "trojnummer": _shirt(pid),
+                "malvakt": _is_gk(pid),
+                "roster_edit": _roster_edit_cell(edits[pid]),
+            }
+            for pid in removed_ids
+        ),
+        key=lambda r: r["namn"] or "",
+    )
+
+    # Kandidater att lägga till: lagets trupp som inte redan finns i matchens.
+    team_player_ids = db.scalars(
+        select(PlayerTeam.player_id).where(PlayerTeam.team == m.team)
+    ).all()
+    lagtrupp = sorted(
+        (
+            {
+                "player_id": p.player_id,
+                "namn": p.name,
+                "trojnummer": p.shirt_no,
+                "malvakt": bool(p.is_goalkeeper),
+            }
+            for p in db.scalars(
+                select(Player).where(Player.player_id.in_(team_player_ids))
+            ).all()
+            if p.player_id not in effective_ids
+        ),
+        key=lambda r: r["namn"] or "",
+    )
+
     data["spelad"] = spelad
     data["trupp_publicerad"] = len(trupp) > 0
     data["trupp"] = trupp
+    data["borttagna"] = borttagna
+    data["lagtrupp"] = lagtrupp
     return data
 
 
@@ -497,6 +634,82 @@ def get_match(
     if m is None:
         raise HTTPException(status_code=404, detail="Matchen finns inte")
     return _match_detail(db, m)
+
+
+# ---------------------------------------------------------------------------
+# Ändra matchlista (steg 15) – SPEC 6.5
+#
+# roster_edits ligger som ett lager ovanpå iBIS. iBIS-datan skrivs aldrig över.
+# Ändringen påverkar både regelmotorn och skottregistreringens spelarlista.
+# Högst en aktiv rad per (match, spelare) – en ny ersätter en tidigare. Att
+# ångra en ändring raderar raden och återställer läget till iBIS.
+# ---------------------------------------------------------------------------
+
+_ROSTER_ACTIONS = ("add", "remove")
+
+
+class RosterEditBody(BaseModel):
+    player_id: int
+    action: str
+    note: str
+    created_by: str | None = None
+
+
+@app.post("/api/matches/{match_id}/roster-edits")
+def post_roster_edit(
+    match_id: int,
+    body: RosterEditBody,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    if db.get(Match, match_id) is None:
+        raise HTTPException(status_code=404, detail="Matchen finns inte")
+    if body.action not in _ROSTER_ACTIONS:
+        raise HTTPException(status_code=400, detail="action måste vara add eller remove")
+    note = body.note.strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Anteckning krävs")
+    if db.get(Player, body.player_id) is None:
+        raise HTTPException(status_code=404, detail="Spelaren finns inte")
+
+    for e in db.scalars(
+        select(RosterEdit).where(
+            RosterEdit.match_id == match_id,
+            RosterEdit.player_id == body.player_id,
+        )
+    ).all():
+        db.delete(e)
+
+    db.add(RosterEdit(
+        match_id=match_id,
+        player_id=body.player_id,
+        action=body.action,
+        note=note,
+        created_at=datetime.now(),
+        created_by=(body.created_by or "").strip() or "admin",
+    ))
+    db.commit()
+    _clear_status_cache()
+    return {"ok": True}
+
+
+@app.delete("/api/matches/{match_id}/roster-edits/{player_id}")
+def delete_roster_edit(
+    match_id: int,
+    player_id: int,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    for e in db.scalars(
+        select(RosterEdit).where(
+            RosterEdit.match_id == match_id,
+            RosterEdit.player_id == player_id,
+        )
+    ).all():
+        db.delete(e)
+    db.commit()
+    _clear_status_cache()
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

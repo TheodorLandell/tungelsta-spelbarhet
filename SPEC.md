@@ -275,10 +275,6 @@ appen bör påminna vid periodbyte eftersom det annars är lätt att glömma.
 Det ska framgå tydligt att totalen och procenten är ofullständiga tills synk skett,
 inte se ut som att spelarna saknar mål.
 
-**Avstämning efter synk.** När iBIS-målen kommit in visar matchvyn en rad i stil
-med "iBIS: 4 mål. Registrerat: 18 skott på mål." Så syns det om någon råkat
-registrera mål som skott på mål.
-
 ### 6.3 Local-first
 
 Registreringen måste fungera utan nät. Sporthallar har ofta dålig täckning, och

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import ShotRegistration from './ShotRegistration'
+import RosterEditor from './RosterEditor'
 import { cacheSquad, loadCachedSquad } from '../lib/shotStore'
 
 function parseKickoff(str) {
@@ -164,7 +165,7 @@ function MatchList({ matches, onSelect }) {
 // Matchvy med skottregistrering
 // ---------------------------------------------------------------------------
 
-function MatchDetail({ match, offlineNotice, onUnauthed }) {
+function MatchDetail({ match, offlineNotice, onUnauthed, onRosterChanged }) {
   const ha = homeAwayLabel(match.hemma)
   const spelad = match.spelad
   const typLabel = matchTypeLabel(match)
@@ -228,6 +229,15 @@ function MatchDetail({ match, offlineNotice, onUnauthed }) {
         <ShotRegistration
           match={match}
           offlineNotice={offlineNotice}
+          onUnauthed={onUnauthed}
+        />
+      )}
+
+      {/* Ändra matchlista (SPEC 6.5) – kräver servern, göms för cachad vy */}
+      {!offlineNotice && onRosterChanged && (
+        <RosterEditor
+          match={match}
+          onChanged={onRosterChanged}
           onUnauthed={onUnauthed}
         />
       )}
@@ -397,6 +407,7 @@ export default function MatchesTab({ team, onUnauthed }) {
             match={detail}
             offlineNotice={offlineNotice}
             onUnauthed={onUnauthed}
+            onRosterChanged={() => loadDetail(selectedId)}
           />
         )}
       </div>
