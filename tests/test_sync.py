@@ -424,26 +424,63 @@ class TestRunSync:
         match = db.get(Match, 3001)
         assert match.opponent == f"Hemmalag {OTHER_ID}"
 
-    def test_cupmatchar_ignoreras(self, db, monkeypatch):
-        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
-
-        cup_comp = {
-            "CompetitionID": 200,
-            "CompetitionTypeID": 3,
-            "Name": "Cupen",
-            "Matches": [make_match_dict(9001, final_result_ts="2020-01-15T21:00:00")],
-        }
-        team_dict = {
+    def _non_series_team_dict(self, comp_type: int, match_dicts: list[dict]) -> dict:
+        return {
             "TeamID": TEAM_A_ID,
             "Name": "Tungelsta IF",
-            "Competitions": [cup_comp],
+            "Competitions": [
+                {
+                    "CompetitionID": 200,
+                    "CompetitionTypeID": comp_type,
+                    "Name": "Cupen" if comp_type == 3 else "Träningsmatcher",
+                    "Matches": match_dicts,
+                }
+            ],
         }
+
+    def test_cupmatch_sparas_men_raknas_inte(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        team_dict = self._non_series_team_dict(
+            3, [make_match_dict(9001, final_result_ts="2020-01-15T21:00:00")]
+        )
         client = build_client(team_a_dict=team_dict)
+
+        result = run_sync(db, client)
+
+        match = db.get(Match, 9001)
+        assert match is not None
+        assert match.team == "A"
+        assert match.counts_for_rules is False
+        # Inga lineups/appearances för matcher som inte räknas
+        client.fetch_lineups.assert_not_called()
+        assert db.scalars(select(Appearance).where(Appearance.match_id == 9001)).all() == []
+        assert result.matches_added == 1
+
+    def test_traningsmatch_annan_competitiontype_sparas_utan_lineups(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Konkret fall ur uppgiften: CompetitionTypeID 3, framtida match
+        m = make_match_dict(1767137, home_team_id=TEAM_A_ID, away_team_id=OTHER_ID,
+                            match_datetime="2026-09-01T20:20:00")
+        client = build_client(team_a_dict=self._non_series_team_dict(3, [m]))
 
         run_sync(db, client)
 
-        assert db.get(Match, 9001) is None
+        match = db.get(Match, 1767137)
+        assert match is not None
+        assert match.counts_for_rules is False
         client.fetch_lineups.assert_not_called()
+
+    def test_seriematch_far_counts_for_rules_true(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = make_match_dict(9100, match_datetime="2099-01-01T19:00:00")
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        run_sync(db, client)
+
+        assert db.get(Match, 9100).counts_for_rules is True
 
     def test_matches_added_räknas_korrekt(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)

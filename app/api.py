@@ -8,12 +8,16 @@ POST /auth/login              – sätt session-cookie efter lösenordsverifikat
 POST /auth/logout             – rensa session-cookie
 POST /api/overrides           – skapa eller ersätt override för en spelare
 DELETE /api/overrides/{id}    – ta bort override för en spelare
+GET  /api/matches             – matchlista per lag
+GET  /api/matches/{id}        – matchvy med trupp
+GET  /api/matches/{id}/shot-events   – alla skotthändelser för en match
+POST /api/matches/{id}/shot-events   – ta emot en batch skotthändelser (idempotent på klient-UUID)
 GET  /{path}                  – serverar byggt frontend (SPA-fallback)
 """
 
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +35,15 @@ from app.auth import (
 from app.config import settings
 from app.database import SessionLocal
 from app.ibis_client import IBISClient
-from app.models import Appearance, Match, Override, Player, PlayerTeam, SyncLog
+from app.models import (
+    Appearance,
+    Match,
+    Override,
+    Player,
+    PlayerTeam,
+    ShotEvent,
+    SyncLog,
+)
 from app.status import get_statuses
 from app.sync import run_sync
 
@@ -390,6 +402,14 @@ def _match_summary(m: Match) -> dict[str, Any]:
     if m.status == "played" and goals_home is not None and goals_away is not None:
         resultat = {"hemma": goals_home, "borta": goals_away}
 
+    # Matcher som inte räknas i reglerna markeras i listan (SPEC 1, 6.1)
+    if m.counts_for_rules:
+        matchtyp = "serie"
+    elif raw.get("CompetitionTypeID") == 3:
+        matchtyp = "cup"
+    else:
+        matchtyp = "traningsmatch"
+
     return {
         "match_id": m.match_id,
         "kickoff": m.kickoff.isoformat(),
@@ -399,6 +419,8 @@ def _match_summary(m: Match) -> dict[str, Any]:
         "status": m.status,
         "omgang": m.round_name,
         "resultat": resultat,
+        "raknas": m.counts_for_rules,
+        "matchtyp": matchtyp,
     }
 
 
@@ -475,6 +497,111 @@ def get_match(
     if m is None:
         raise HTTPException(status_code=404, detail="Matchen finns inte")
     return _match_detail(db, m)
+
+
+# ---------------------------------------------------------------------------
+# Skottsynk (steg 14) – SPEC 6.3 och 6.4
+#
+# Klientens UUID är primärnyckel, så en batch kan skickas om hur många gånger
+# som helst utan att bli dubbletter. Tombstones (deleted_at) skickas som vanliga
+# händelser – ingenting raderas någonsin.
+# ---------------------------------------------------------------------------
+
+_SHOT_KINDS = ("on_goal", "missed", "blocked")
+
+
+class ShotEventIn(BaseModel):
+    id: str
+    player_id: int
+    kind: str
+    period: int
+    created_at: str
+    created_by: str | None = None
+    deleted_at: str | None = None
+
+
+class ShotEventBatch(BaseModel):
+    handelser: list[ShotEventIn]
+
+
+def _parse_client_ts(value: str) -> datetime:
+    """Klienten skickar ISO-tid i UTC (Date.toISOString). Lagras naivt i UTC."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _shot_event_out(e: ShotEvent) -> dict[str, Any]:
+    return {
+        "id": e.id,
+        "match_id": e.match_id,
+        "player_id": e.player_id,
+        "kind": e.kind,
+        "period": e.period,
+        "created_at": e.created_at.isoformat() + "Z",
+        "created_by": e.created_by,
+        "deleted_at": e.deleted_at.isoformat() + "Z" if e.deleted_at else None,
+    }
+
+
+@app.get("/api/matches/{match_id}/shot-events")
+def get_shot_events(
+    match_id: int,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    if db.get(Match, match_id) is None:
+        raise HTTPException(status_code=404, detail="Matchen finns inte")
+
+    rows = db.scalars(
+        select(ShotEvent)
+        .where(ShotEvent.match_id == match_id)
+        .order_by(ShotEvent.created_at)
+    ).all()
+    return {"handelser": [_shot_event_out(e) for e in rows]}
+
+
+@app.post("/api/matches/{match_id}/shot-events")
+def post_shot_events(
+    match_id: int,
+    body: ShotEventBatch,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    if db.get(Match, match_id) is None:
+        raise HTTPException(status_code=404, detail="Matchen finns inte")
+
+    sparade: list[str] = []
+    for h in body.handelser:
+        if not h.id:
+            raise HTTPException(status_code=422, detail="Händelse saknar id")
+        if h.kind not in _SHOT_KINDS:
+            raise HTTPException(status_code=422, detail=f"Ogiltig kategori: {h.kind}")
+        if h.period not in (1, 2, 3):
+            raise HTTPException(status_code=422, detail=f"Ogiltig period: {h.period}")
+
+        deleted_at = _parse_client_ts(h.deleted_at) if h.deleted_at else None
+        existing = db.get(ShotEvent, h.id)
+        if existing is None:
+            db.add(ShotEvent(
+                id=h.id,
+                match_id=match_id,
+                player_id=h.player_id,
+                kind=h.kind,
+                period=h.period,
+                created_at=_parse_client_ts(h.created_at),
+                created_by=(h.created_by or None),
+                deleted_at=deleted_at,
+            ))
+        elif deleted_at is not None and existing.deleted_at is None:
+            # Samma händelse igen – det enda som kan ha ändrats är tombstonen.
+            existing.deleted_at = deleted_at
+
+        sparade.append(h.id)
+
+    db.commit()
+    return {"sparade": sparade, "antal": len(sparade)}
 
 
 # ---------------------------------------------------------------------------

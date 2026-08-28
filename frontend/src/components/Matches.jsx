@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import ShotRegistration from './ShotRegistration'
+import { cacheSquad, loadCachedSquad } from '../lib/shotStore'
 
 function parseKickoff(str) {
   // Naiv lokaltid från iBIS, "2026-09-19T13:00:00" – tolkas som Europe/Stockholm
@@ -28,6 +30,24 @@ function homeAwayLabel(hemma) {
   return null
 }
 
+// Matcher som inte räknas i låsningsreglerna (cup, träningsmatch) markeras
+// tydligt i listan och i matchvyn.
+function matchTypeLabel(match) {
+  if (match.raknas !== false) return null
+  return match.matchtyp === 'cup' ? 'Cup' : 'Träningsmatch'
+}
+
+function NonCountingBadge({ label, className = '' }) {
+  return (
+    <span
+      className={`shrink-0 text-[10px] font-bold uppercase tracking-wide
+                  text-purple-700 bg-purple-100 rounded px-1.5 py-0.5 ${className}`}
+    >
+      {label}
+    </span>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Matchlista
 // ---------------------------------------------------------------------------
@@ -36,6 +56,7 @@ function MatchListRow({ match, isNext, onSelect, rowRef }) {
   const installd = match.status === 'cancelled'
   const spelad = match.status === 'played'
   const ha = homeAwayLabel(match.hemma)
+  const typLabel = matchTypeLabel(match)
 
   return (
     <button
@@ -72,6 +93,7 @@ function MatchListRow({ match, isNext, onSelect, rowRef }) {
               Nästa
             </span>
           )}
+          {typLabel && <NonCountingBadge label={typLabel} />}
         </div>
         <div className="text-xs text-gray-500 mt-0.5 truncate">
           {[ha, match.hall].filter(Boolean).join(' · ') || 'Plats saknas'}
@@ -139,48 +161,29 @@ function MatchList({ matches, onSelect }) {
 }
 
 // ---------------------------------------------------------------------------
-// Matchvy (skrivskyddad)
+// Matchvy med skottregistrering
 // ---------------------------------------------------------------------------
 
-function SquadRow({ player, spelad }) {
-  return (
-    <div className="px-4 py-2.5 flex gap-3 items-center">
-      <span className="w-8 shrink-0 text-right text-sm text-gray-400 tabular-nums select-none">
-        {player.trojnummer != null ? player.trojnummer : ''}
-      </span>
-      <span className="flex-1 min-w-0 text-sm text-gray-900 truncate">
-        {player.namn}
-        {player.malvakt && (
-          <span className="ml-2 text-[10px] font-bold uppercase tracking-wide
-                           text-indigo-700 bg-indigo-100 rounded px-1.5 py-0.5 align-middle">
-            MV
-          </span>
-        )}
-      </span>
-      {spelad && (
-        <span className="shrink-0 flex gap-3 text-sm tabular-nums text-gray-700">
-          <span className="w-6 text-right" title="Mål">{player.mal ?? 0}</span>
-          <span className="w-6 text-right" title="Assist">{player.assist ?? 0}</span>
-          <span className="w-6 text-right" title="Utvisningsminuter">
-            {player.utvisningsminuter ?? 0}
-          </span>
-        </span>
-      )}
-    </div>
-  )
-}
-
-function MatchDetail({ match }) {
+function MatchDetail({ match, offlineNotice, onUnauthed }) {
   const ha = homeAwayLabel(match.hemma)
   const spelad = match.spelad
+  const typLabel = matchTypeLabel(match)
 
   return (
     <div>
       {/* Matchhuvud */}
       <div className="border border-gray-200 rounded-xl bg-white p-4 mb-5">
-        <h2 className="text-lg font-bold text-gray-900 leading-tight">
-          {match.motstandare ?? 'Okänd motståndare'}
-        </h2>
+        <div className="flex items-start justify-between gap-2">
+          <h2 className="text-lg font-bold text-gray-900 leading-tight">
+            {match.motstandare ?? 'Okänd motståndare'}
+          </h2>
+          {typLabel && <NonCountingBadge label={typLabel} className="mt-1" />}
+        </div>
+        {typLabel && (
+          <p className="text-xs text-purple-700 mt-1">
+            Räknas inte i låsningsreglerna. Skott går att registrera som vanligt.
+          </p>
+        )}
         <p className="text-sm text-gray-500 mt-1">
           {[
             formatDay(match.kickoff),
@@ -210,35 +213,23 @@ function MatchDetail({ match }) {
         </div>
       </div>
 
-      {/* Trupp */}
+      {/* Skottregistrering */}
       <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-2">
-        Trupp
+        Skottregistrering
       </h3>
 
       {!match.trupp_publicerad ? (
         <div className="border border-gray-200 bg-gray-50 rounded-xl px-4 py-6
                         text-sm text-gray-500 text-center">
-          Truppen är inte publicerad än.
+          Truppen är inte publicerad än. Öppna matchen igen när den finns i iBIS
+          så cachas den för offline.
         </div>
       ) : (
-        <div className="border border-gray-200 rounded-xl bg-white divide-y divide-gray-100
-                        overflow-hidden">
-          {spelad && (
-            <div className="px-4 py-2 flex gap-3 items-center bg-gray-50
-                            text-[10px] font-semibold uppercase tracking-wide text-gray-400">
-              <span className="w-8 shrink-0" />
-              <span className="flex-1">Spelare</span>
-              <span className="shrink-0 flex gap-3">
-                <span className="w-6 text-right">Mål</span>
-                <span className="w-6 text-right">Ass</span>
-                <span className="w-6 text-right">Utv</span>
-              </span>
-            </div>
-          )}
-          {match.trupp.map(p => (
-            <SquadRow key={p.player_id} player={p} spelad={spelad} />
-          ))}
-        </div>
+        <ShotRegistration
+          match={match}
+          offlineNotice={offlineNotice}
+          onUnauthed={onUnauthed}
+        />
       )}
     </div>
   )
@@ -248,10 +239,22 @@ function MatchDetail({ match }) {
 // Behållare: växlar mellan lista och vald match, sköter hämtning
 // ---------------------------------------------------------------------------
 
+function formatStamp(isoStr) {
+  if (!isoStr) return ''
+  const d = new Date(isoStr)
+  return d.toLocaleString('sv-SE', {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 export default function MatchesTab({ team, onUnauthed }) {
   const [matches, setMatches] = useState(null)
   const [selectedId, setSelectedId] = useState(null)
   const [detail, setDetail] = useState(null)
+  const [offlineNotice, setOfflineNotice] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -277,26 +280,64 @@ export default function MatchesTab({ team, onUnauthed }) {
     }
   }, [team])
 
-  const loadDetail = useCallback(async id => {
-    setLoading(true)
-    setError(null)
+  // Faller tillbaka på den cachade truppen om servern inte går att nå eller
+  // svarar med ett fel. Skiljer på de två i felmeddelandet, men bara när det
+  // inte finns någon cache att visa.
+  const useCachedOr = useCallback(async (id, serverMsg) => {
     try {
-      const res = await fetch(`/api/matches/${id}`)
-      if (res.status === 401) {
-        onUnauthed()
-        return
+      const cached = await loadCachedSquad(id)
+      if (cached?.detail) {
+        setDetail(cached.detail)
+        setOfflineNotice(
+          `Kunde inte uppdatera truppen från servern. Visar sparad version från ${formatStamp(
+            cached.cached_at,
+          )}.`,
+        )
+        return true
       }
-      if (!res.ok) {
-        setError('Kunde inte hämta matchen. Servern svarade med ett fel.')
-        return
-      }
-      setDetail(await res.json())
     } catch {
-      setError('Kunde inte nå servern. Kontrollera nätet och prova igen.')
-    } finally {
-      setLoading(false)
+      // IndexedDB otillgänglig – falla igenom till felmeddelandet
     }
+    setError(serverMsg)
+    return false
   }, [])
+
+  const loadDetail = useCallback(
+    async id => {
+      setLoading(true)
+      setError(null)
+      setOfflineNotice(null)
+      try {
+        const res = await fetch(`/api/matches/${id}`)
+        if (res.status === 401) {
+          onUnauthed()
+          return
+        }
+        if (!res.ok) {
+          await useCachedOr(
+            id,
+            'Kunde inte hämta matchen. Servern svarade med ett fel.',
+          )
+          return
+        }
+        const data = await res.json()
+        setDetail(data)
+        try {
+          await cacheSquad(id, data)
+        } catch {
+          // Cachning misslyckades – registrering funkar ändå så länge nätet finns
+        }
+      } catch {
+        await useCachedOr(
+          id,
+          'Kunde inte nå servern. Kontrollera nätet och prova igen.',
+        )
+      } finally {
+        setLoading(false)
+      }
+    },
+    [onUnauthed, useCachedOr],
+  )
 
   // Byte av lag: tillbaka till listan och hämta om
   useEffect(() => {
@@ -351,7 +392,13 @@ export default function MatchesTab({ team, onUnauthed }) {
         >
           ‹ Matchlista
         </button>
-        {detail && <MatchDetail match={detail} />}
+        {detail && (
+          <MatchDetail
+            match={detail}
+            offlineNotice={offlineNotice}
+            onUnauthed={onUnauthed}
+          />
+        )}
       </div>
     )
   }

@@ -16,6 +16,11 @@ class Match(Base):
     status: Mapped[str] = mapped_column(String(16))        # 'played' | 'scheduled' | 'cancelled'
     round_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     opponent: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # CompetitionTypeID == 1 (serie) → True. Cup, träningsmatch och allt annat
+    # → False. Endast matcher med True skickas in i regelmotorn.
+    counts_for_rules: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="1"
+    )
     raw: Mapped[dict] = mapped_column(JSON)
 
     appearances: Mapped[list["Appearance"]] = relationship(back_populates="match")
@@ -82,6 +87,28 @@ class Override(Base):
     data_snapshot: Mapped[datetime] = mapped_column(DateTime)
 
     player: Mapped["Player"] = relationship(back_populates="overrides")
+
+
+class ShotEvent(Base):
+    """
+    Manuellt registrerade skott (SPEC 6.2–6.4). Primärnyckeln är ett UUID som
+    skapas på klienten, så att samma händelse kan skickas flera gånger utan att
+    bli en dubblett. Borttagning är en tombstone (deleted_at), aldrig en radering.
+    created_by är tränarens kortnamn från klienten.
+    """
+
+    __tablename__ = "shot_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    match_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("matches.match_id"), index=True
+    )
+    player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.player_id"))
+    kind: Mapped[str] = mapped_column(String(16))          # 'on_goal' | 'missed' | 'blocked'
+    period: Mapped[int] = mapped_column(Integer)           # 1 | 2 | 3
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+    created_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class SyncLog(Base):

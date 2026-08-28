@@ -65,16 +65,18 @@ def add_match(db, match_id, team, kickoff, status="played"):
 def add_match_raw(db, match_id, team, kickoff, status="scheduled", *,
                   home_team_id=1977, away_team_id=9999, venue="Tungelstahallen",
                   goals_home=None, goals_away=None, round_name="Omgång 1",
-                  opponent="Motståndarna"):
+                  opponent="Motståndarna", counts_for_rules=True, competition_type=1):
     db.add(Match(
         match_id=match_id, team=team, competition_id=100,
         kickoff=kickoff, status=status, round_name=round_name, opponent=opponent,
+        counts_for_rules=counts_for_rules,
         raw={
             "HomeTeamID": home_team_id,
             "AwayTeamID": away_team_id,
             "MainVenue": venue,
             "GoalsHomeTeam": goals_home,
             "GoalsAwayTeam": goals_away,
+            "CompetitionTypeID": competition_type,
         },
     ))
 
@@ -491,6 +493,33 @@ class TestGetMatches:
         assert row["hall"] is None
         assert row["resultat"] is None
 
+    def test_seriematch_markeras_som_raknande(self, db, api_client):
+        add_match_raw(db, 1, "A", datetime(2026, 9, 1, 13))
+        db.flush()
+
+        row = api_client.get("/api/matches?team=A").json()["matcher"][0]
+        assert row["raknas"] is True
+        assert row["matchtyp"] == "serie"
+
+    def test_cupmatch_markeras_och_raknas_inte(self, db, api_client):
+        add_match_raw(db, 1, "A", datetime(2026, 9, 1, 13),
+                      counts_for_rules=False, competition_type=3)
+        db.flush()
+
+        row = api_client.get("/api/matches?team=A").json()["matcher"][0]
+        assert row["raknas"] is False
+        assert row["matchtyp"] == "cup"
+
+    def test_traningsmatch_markeras_och_raknas_inte(self, db, api_client):
+        add_match_raw(db, 1767137, "A", datetime(2026, 9, 1, 20, 20),
+                      counts_for_rules=False, competition_type=5,
+                      opponent="Hammarby IF IBF Herr A")
+        db.flush()
+
+        row = api_client.get("/api/matches?team=A").json()["matcher"][0]
+        assert row["raknas"] is False
+        assert row["matchtyp"] == "traningsmatch"
+
 
 # ---------------------------------------------------------------------------
 # GET /api/matches/{id} – matchvy med trupp
@@ -549,3 +578,89 @@ class TestGetMatch:
         assert row["mal"] == 2
         assert row["assist"] == 1
         assert row["utvisningsminuter"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Skottsynk – GET/POST /api/matches/{id}/shot-events  (steg 14)
+# ---------------------------------------------------------------------------
+
+def shot_event(id, *, player_id=10, kind="on_goal", period=1,
+               created_at="2026-09-01T18:05:00.000Z", created_by="Theo",
+               deleted_at=None):
+    return {
+        "id": id, "player_id": player_id, "kind": kind, "period": period,
+        "created_at": created_at, "created_by": created_by, "deleted_at": deleted_at,
+    }
+
+
+class TestShotEvents:
+    def _match(self, db):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="scheduled")
+        add_player(db, 10, "Spelare", "7")
+        db.flush()
+
+    def test_okand_match_ger_404(self, db, api_client):
+        assert api_client.get("/api/matches/999/shot-events").status_code == 404
+        res = api_client.post("/api/matches/999/shot-events",
+                              json={"handelser": [shot_event("a")]})
+        assert res.status_code == 404
+
+    def test_batch_sparas_och_hamtas(self, db, api_client):
+        self._match(db)
+        res = api_client.post("/api/matches/1/shot-events", json={"handelser": [
+            shot_event("11111111-1111-4111-8111-111111111111", kind="on_goal"),
+            shot_event("22222222-2222-4222-8222-222222222222", kind="missed", period=2),
+        ]})
+        assert res.status_code == 200
+        assert res.json()["antal"] == 2
+
+        data = api_client.get("/api/matches/1/shot-events").json()
+        assert [h["id"] for h in data["handelser"]] == [
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        ]
+        assert data["handelser"][0]["kind"] == "on_goal"
+        assert data["handelser"][1]["period"] == 2
+        assert data["handelser"][0]["created_by"] == "Theo"
+
+    def test_samma_batch_tva_ganger_ger_inga_dubbletter(self, db, api_client):
+        self._match(db)
+        batch = {"handelser": [shot_event("33333333-3333-4333-8333-333333333333")]}
+        api_client.post("/api/matches/1/shot-events", json=batch)
+        api_client.post("/api/matches/1/shot-events", json=batch)
+
+        data = api_client.get("/api/matches/1/shot-events").json()
+        assert len(data["handelser"]) == 1
+
+    def test_tombstone_synkas_som_vanlig_handelse(self, db, api_client):
+        self._match(db)
+        eid = "44444444-4444-4444-8444-444444444444"
+        # Först den aktiva händelsen
+        api_client.post("/api/matches/1/shot-events",
+                        json={"handelser": [shot_event(eid)]})
+        # Sedan samma id igen, nu med deleted_at satt
+        api_client.post("/api/matches/1/shot-events", json={"handelser": [
+            shot_event(eid, deleted_at="2026-09-01T18:30:00.000Z"),
+        ]})
+
+        data = api_client.get("/api/matches/1/shot-events").json()
+        assert len(data["handelser"]) == 1
+        assert data["handelser"][0]["deleted_at"] is not None
+
+    def test_ogiltig_kategori_ger_422(self, db, api_client):
+        self._match(db)
+        res = api_client.post("/api/matches/1/shot-events",
+                              json={"handelser": [shot_event("x", kind="goal")]})
+        assert res.status_code == 422
+
+    def test_ogiltig_period_ger_422(self, db, api_client):
+        self._match(db)
+        res = api_client.post("/api/matches/1/shot-events",
+                              json={"handelser": [shot_event("x", period=4)]})
+        assert res.status_code == 422
+
+    def test_tom_batch_ar_ok(self, db, api_client):
+        self._match(db)
+        res = api_client.post("/api/matches/1/shot-events", json={"handelser": []})
+        assert res.status_code == 200
+        assert res.json()["antal"] == 0

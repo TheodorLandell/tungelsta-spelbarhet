@@ -25,9 +25,22 @@ from app.models import Base, Match as OrmMatch, Player as OrmPlayer
 
 
 def get_statuses(db: Session) -> tuple[dict[int, PlayerStatus], list[str]]:
-    """Läser matcher och appearances ur databasen och kör regelmotorn."""
-    orm_matches = db.scalars(select(OrmMatch)).all()
-    orm_appearances = db.scalars(select(OrmAppearance)).all()
+    """
+    Läser matcher och appearances ur databasen och kör regelmotorn.
+
+    Endast matcher med counts_for_rules == True skickas in. Cup- och
+    träningsmatcher (och deras appearances) filtreras bort helt – de får aldrig
+    påverka kvalificeringsregeln eller kedjeregeln.
+    """
+    orm_matches = db.scalars(
+        select(OrmMatch).where(OrmMatch.counts_for_rules.is_(True))
+    ).all()
+    counting_ids = {m.match_id for m in orm_matches}
+    orm_appearances = [
+        a
+        for a in db.scalars(select(OrmAppearance)).all()
+        if a.match_id in counting_ids
+    ]
 
     elig_matches = [
         EligMatch(

@@ -19,7 +19,6 @@ from app.ibis_client import (
     IBISMatchPlayer,
     IBISSquadPlayer,
     IBISTeam,
-    filter_series_competitions,
     get_team_players,
     is_goalkeeper_player,
     is_played,
@@ -62,7 +61,13 @@ def _opponent(m: IBISMatch, team_id: int) -> str | None:
 
 
 def _upsert_match(
-    db: Session, m: IBISMatch, team_label: str, team_id: int, raw: dict
+    db: Session,
+    m: IBISMatch,
+    team_label: str,
+    team_id: int,
+    raw: dict,
+    *,
+    counts_for_rules: bool = True,
 ) -> tuple[Match, bool]:
     """Sparar eller uppdaterar en match. Returnerar (orm-objekt, är_ny)."""
     existing = db.get(Match, m.MatchID)
@@ -78,12 +83,14 @@ def _upsert_match(
             status=status,
             round_name=m.RoundName,
             opponent=_opponent(m, team_id),
+            counts_for_rules=counts_for_rules,
             raw=raw,
         )
         db.add(match)
         return match, True
 
     existing.status = status
+    existing.counts_for_rules = counts_for_rules
     existing.raw = raw
     return existing, False
 
@@ -219,20 +226,32 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
             raw_team = client.fetch_team_raw(settings.season_id, team_id)
             team = IBISTeam.model_validate(raw_team)
 
-            # Bygg uppslag match_id → rådata för seriematcher
+            # Bygg uppslag match_id → rådata för alla matcher (även cup/träning)
             raw_by_match: dict[int, dict] = {}
             for comp_data in raw_team.get("Competitions", []):
-                if comp_data.get("CompetitionTypeID") == 1:
-                    for m_data in comp_data.get("Matches", []):
-                        raw_by_match[m_data["MatchID"]] = m_data
+                for m_data in comp_data.get("Matches", []):
+                    raw_by_match[m_data["MatchID"]] = m_data
 
-            for comp in filter_series_competitions(team):
+            # Alla tävlingar, inte bara serien. Matcher med annan
+            # CompetitionTypeID sparas för skottregistrering men markeras med
+            # counts_for_rules = False och rör aldrig regelmotorn.
+            for comp in team.Competitions:
+                counts_for_rules = comp.CompetitionTypeID == 1
                 for match in comp.Matches:
                     raw = raw_by_match.get(match.MatchID, match.model_dump(mode="json"))
-                    db_match, is_new = _upsert_match(db, match, team_label, team_id, raw)
+                    db_match, is_new = _upsert_match(
+                        db, match, team_label, team_id, raw,
+                        counts_for_rules=counts_for_rules,
+                    )
 
                     if is_new:
                         matches_added += 1
+
+                    # Cup och träningsmatcher: bara matchraden sparas. Inga
+                    # lineups, inga appearances, inga varningar – de påverkar
+                    # ändå inte regelmotorn.
+                    if not counts_for_rules:
+                        continue
 
                     # Avbruten utan resultat: logga varning, hoppa över appearances
                     if match.Abandoned and not is_played(match):

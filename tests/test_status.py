@@ -23,10 +23,10 @@ def db():
         yield session
 
 
-def add_match(db, match_id, team, kickoff, status="played"):
+def add_match(db, match_id, team, kickoff, status="played", counts_for_rules=True):
     db.add(OrmMatch(
         match_id=match_id, team=team, competition_id=100,
-        kickoff=kickoff, status=status, raw={},
+        kickoff=kickoff, status=status, counts_for_rules=counts_for_rules, raw={},
     ))
 
 
@@ -145,3 +145,85 @@ class TestGetStatuses:
         # Inga exceptions = mappningen fungerade
         statuses, _ = get_statuses(db)
         assert 42 in statuses
+
+
+class TestTraningsmatcherRaknasInte:
+    """En match med counts_for_rules == False får aldrig påverka reglerna."""
+
+    def test_kvalificeringsregeln_en_traningsmatch_i_a_laser_inte(self, db):
+        # Spelaren har bara en A-träningsmatch, aldrig någon B-match.
+        # Räknade den skulle kvalificeringsregeln låsa spelaren direkt.
+        add_match(db, 1, "A", datetime(2026, 9, 1, 20, 20), counts_for_rules=False)
+        add_appearance(db, 1, 42, "Träningsspelare")
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        # Träningsmatchen skickas inte in alls → spelaren finns inte i utfallet
+        assert 42 not in statuses
+
+    def test_kvalificeringsregeln_traningsmatch_paverkar_inte_riktig_kedja(self, db):
+        # B (räknas), sedan A-träningsmatch (räknas inte), sedan A (räknas).
+        # Räknade träningsmatchen skulle spelaren ha 2 A i rad; nu bara 1.
+        add_match(db, 1, "B", datetime(2026, 8, 1), counts_for_rules=True)
+        add_match(db, 2, "A", datetime(2026, 8, 15), counts_for_rules=False)
+        add_match(db, 3, "A", datetime(2026, 9, 1), counts_for_rules=True)
+        for mid in (1, 2, 3):
+            add_appearance(db, mid, 42, "Spelare")
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        s = statuses[42]
+        assert not s.locked
+        assert s.matches_left == 1          # bara en räknad A-match
+        assert s.a_match_ids == [3]
+
+    def test_kedjeregeln_traningsmatch_okar_inte_kedjan(self, db):
+        # B, A, A (räknas) = 2 i rad → måste stå över, men inte låst.
+        # En A-träningsmatch mitt i får inte göra det till 3 i rad.
+        add_match(db, 1, "B", datetime(2026, 8, 1))
+        add_match(db, 2, "A", datetime(2026, 8, 10))
+        add_match(db, 3, "A", datetime(2026, 8, 20), counts_for_rules=False)  # träning
+        add_match(db, 4, "A", datetime(2026, 8, 30))
+        for mid in (1, 2, 3, 4):
+            add_appearance(db, mid, 42, "Spelare")
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        s = statuses[42]
+        assert not s.locked
+        assert s.matches_left == 0
+        assert sorted(s.a_match_ids) == [2, 4]
+
+    def test_kedjeregeln_traningsmatch_nollstaller_inte_kedjan(self, db):
+        # B, A, A (räknas). En A-träningsmatch som spelaren INTE står i får
+        # inte heller nollställa kedjan – den ska ignoreras helt.
+        add_match(db, 1, "B", datetime(2026, 8, 1))
+        add_match(db, 2, "A", datetime(2026, 8, 10))
+        add_match(db, 3, "A", datetime(2026, 8, 20), counts_for_rules=False)
+        add_match(db, 4, "A", datetime(2026, 8, 30))
+        add_appearance(db, 1, 42, "Spelare")
+        add_appearance(db, 2, 42, "Spelare")
+        add_appearance(db, 4, 42, "Spelare")  # står inte i träningsmatch 3
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        s = statuses[42]
+        assert not s.locked
+        assert s.matches_left == 0          # 2 räknade A i rad, kedjan obruten
+        assert s.consecutive_a == 2
+
+    def test_appearances_i_traningsmatch_ignoreras_helt(self, db):
+        # Enbart en träningsmatch i databasen → tomt utfall, inga spelare.
+        add_match(db, 99, "A", datetime(2026, 9, 1), counts_for_rules=False)
+        add_appearance(db, 99, 1, "En")
+        add_appearance(db, 99, 2, "Två")
+        db.flush()
+
+        statuses, warnings = get_statuses(db)
+
+        assert statuses == {}
+        assert warnings == []
