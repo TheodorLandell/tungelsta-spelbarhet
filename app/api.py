@@ -1,19 +1,24 @@
 """
 FastAPI-endpoints för spelbarhetskoll.
 
+GET  /health                  – hälsokontroll, kräver inte inloggning
 GET  /api/status              – beräknad spelbarhetslista grupperad i tre grupper
 POST /api/sync                – kör synken manuellt
 POST /auth/login              – sätt session-cookie efter lösenordsverifikation
 POST /auth/logout             – rensa session-cookie
 POST /api/overrides           – skapa eller ersätt override för en spelare
 DELETE /api/overrides/{id}    – ta bort override för en spelare
+GET  /{path}                  – serverar byggt frontend (SPA-fallback)
 """
 
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -29,7 +34,17 @@ from app.models import Match, Override, Player, SyncLog
 from app.status import get_statuses
 from app.sync import run_sync
 
-app = FastAPI()
+_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    from app.scheduler import start_scheduler
+    start_scheduler()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 _cache_lock = threading.Lock()
 _status_cache: dict[str, Any] | None = None
@@ -187,6 +202,15 @@ def _build_status_response(db: Session) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Health (ingen auth)
+# ---------------------------------------------------------------------------
+
+@app.get("/health", include_in_schema=False)
+def health() -> dict:
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
@@ -306,3 +330,17 @@ def delete_override(
     db.commit()
     _clear_status_cache()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Statiska filer och SPA-fallback (måste vara sist)
+# ---------------------------------------------------------------------------
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def spa_catchall(full_path: str) -> FileResponse:
+    if not _DIST.exists():
+        raise HTTPException(status_code=404, detail="Frontend ej byggd")
+    candidate = _DIST / full_path if full_path else _DIST / "index.html"
+    if candidate.is_file():
+        return FileResponse(str(candidate))
+    return FileResponse(str(_DIST / "index.html"))

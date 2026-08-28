@@ -1,0 +1,17 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Databasen lagras i volymen så att den överlever omstarter.
+      # Överskriver eventuellt DATABASE_URL i .env.
+      DATABASE_URL: sqlite:////data/tungelsta.db
+    volumes:
+      - tungelsta_data:/data
+    restart: unless-stopped
+
+volumes:
+  tungelsta_data:
