@@ -1,0 +1,3 @@
+# Skalscript måste ha LF som radslut även vid checkout på Windows,
+# annars failar entrypoint.sh i Linux-containern.
+*.sh text eol=lf
