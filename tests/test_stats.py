@@ -83,9 +83,10 @@ def add_appearance(db, match_id, player_id, name="Spelare", *,
     ))
 
 
-def add_shot(db, shot_id, match_id, player_id, kind, *, period=1, deleted_at=None):
+def add_shot(db, shot_id, match_id, player_id, kind, *, side="egen",
+             period=1, deleted_at=None):
     db.add(ShotEvent(
-        id=shot_id, match_id=match_id, player_id=player_id, kind=kind,
+        id=shot_id, match_id=match_id, player_id=player_id, side=side, kind=kind,
         period=period, created_at=datetime(2026, 9, 1, 19, 0),
         created_by="Theo", deleted_at=deleted_at,
     ))
@@ -325,6 +326,18 @@ class TestSkott:
         assert skott["registrerat"] is True
         assert skott["pa_mal"]["antal"] == 1
         assert skott["totalt"] == 1
+
+    def test_motstandarens_skott_markerar_inte_matchen_som_registrerad(self, client, db):
+        # Bara motståndarens skott är registrerat i matchen. Våra spelares
+        # skottfält ska vara tomma (registrerat=False), inte noll (SPEC 6.1/7).
+        add_match(db, 1, "A", datetime(2026, 9, 1))
+        add_player(db, 10, "Kalle", "7")
+        add_appearance(db, 1, 10, "Kalle", goals=1)
+        add_shot(db, "o1", 1, None, "on_goal", side="motstandare")
+        db.flush()
+
+        row = rows_by_id(client.get("/api/stats?team=A").json())[10]
+        assert row["skott"] == {"registrerat": False}
 
     def test_registrerad_match_men_spelaren_utan_skott_ger_nollor(self, client, db):
         # Match 1 har registrering (för en annan spelare). Kalle stod i truppen

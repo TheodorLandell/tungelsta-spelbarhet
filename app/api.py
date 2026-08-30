@@ -19,8 +19,9 @@ GET  /{path}                  – serverar byggt frontend (SPA-fallback)
 """
 
 import threading
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,12 @@ from app.auth import (
 )
 from app.config import settings
 from app.database import SessionLocal
-from app.ibis_client import IBISClient
+from app.ibis_client import (
+    IBISClient,
+    IBISMatch,
+    get_team_players,
+    is_played,
+)
 from app.models import (
     Appearance,
     Match,
@@ -50,7 +56,7 @@ from app.models import (
 )
 from app.stats import SCOPES, compute_stats
 from app.status import get_statuses
-from app.sync import run_sync
+from app.sync import _match_status, _now_naive, run_sync
 
 _DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
@@ -67,6 +73,16 @@ app = FastAPI(lifespan=lifespan)
 _cache_lock = threading.Lock()
 _status_cache: dict[str, Any] | None = None
 
+# Live-uppdatering av matchresultatet (SPEC 6.6). Svaret cachas ~30 sekunder på
+# servern, så att flera klienter som pollar samtidigt bara ger ett anrop mot
+# iBIS. refreshing hindrar att två samtidiga förfrågningar båda ringer iBIS.
+LIVE_TTL_SECONDS = 30
+LIVE_WINDOW_HOURS = 4
+LIVE_IBIS_TIMEOUT = 6.0
+
+_live_lock = threading.Lock()
+_live_state: dict[str, Any] = {"ts": None, "payload": None, "refreshing": False}
+
 _COOKIE_MAX_AGE = 30 * 24 * 3600
 
 
@@ -82,6 +98,13 @@ def _clear_status_cache() -> None:
     global _status_cache
     with _cache_lock:
         _status_cache = None
+
+
+def _clear_live_cache() -> None:
+    with _live_lock:
+        _live_state["ts"] = None
+        _live_state["payload"] = None
+        _live_state["refreshing"] = False
 
 
 def _last_sync_ts(db: Session) -> str | None:
@@ -229,9 +252,12 @@ def _build_status_response(db: Session) -> dict[str, Any]:
         else:
             available.append(row)
 
-    # Spelare i truppen som inte spelat någon match alls
+    # Listan tar bara med spelare som stått i truppen i en spelad seriematch
+    # (de finns då i statuses ovan) – inte hela den registrerade truppen
+    # (SPEC 5). Undantaget är en spelare med en aktiv override: den är en
+    # medveten åtgärd av tränaren och ska synas även utan spelad match.
     for pid, p in players_by_id.items():
-        if pid not in seen_ids:
+        if pid not in seen_ids and pid in active_overrides:
             ovr = active_overrides.get(pid)
             matcher_kvar = 2
             if ovr is not None and ovr.kind == "set_matches_left":
@@ -446,6 +472,12 @@ def _match_summary(m: Match) -> dict[str, Any]:
     home_id = raw.get("HomeTeamID")
     hemma = None if home_id is None else home_id == _team_id_for(m.team)
 
+    def _clean(v: Any) -> str | None:
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    hemmalag = _clean(raw.get("HomeTeam"))
+    bortalag = _clean(raw.get("AwayTeam"))
+
     hall = raw.get("MainVenue") or raw.get("Venue")
     hall = hall.strip() if isinstance(hall, str) and hall.strip() else None
 
@@ -468,6 +500,8 @@ def _match_summary(m: Match) -> dict[str, Any]:
         "kickoff": m.kickoff.isoformat(),
         "motstandare": m.opponent,
         "hemma": hemma,
+        "hemmalag": hemmalag,
+        "bortalag": bortalag,
         "hall": hall,
         "status": m.status,
         "omgang": m.round_name,
@@ -603,6 +637,17 @@ def _match_detail(db: Session, m: Match) -> dict[str, Any]:
         key=lambda r: r["namn"] or "",
     )
 
+    # Lagmål till matchhuvudet (SPEC 6.2). Motståndarens mål hämtas från iBIS
+    # precis som våra egna, inte manuellt. null tills iBIS synkats.
+    resultat = data["resultat"]
+    if resultat is not None and data["hemma"] is not None:
+        if data["hemma"]:
+            data["mal"], data["motstandare_mal"] = resultat["hemma"], resultat["borta"]
+        else:
+            data["mal"], data["motstandare_mal"] = resultat["borta"], resultat["hemma"]
+    else:
+        data["mal"] = data["motstandare_mal"] = None
+
     data["spelad"] = spelad
     data["trupp_publicerad"] = len(trupp) > 0
     data["trupp"] = trupp
@@ -636,6 +681,142 @@ def get_match(
     if m is None:
         raise HTTPException(status_code=404, detail="Matchen finns inte")
     return _match_detail(db, m)
+
+
+# ---------------------------------------------------------------------------
+# Live-uppdatering av matchresultatet (SPEC 6.6)
+#
+# Hemmalaget rapporterar mål löpande i iBIS under matchen. GET /api/live hämtar
+# de pågående matchernas resultat och spelarstatistik – inte hela synken. Svaret
+# cachas ~30 sekunder på servern, och rör aldrig regelmotorns cache: spelbarhets-
+# och statistikvyn uppdateras fortfarande bara via Uppdatera-knappen och
+# nattjobbet. Endpointen skriver inget till databasen.
+#
+# Pågående match = kickoff har passerat, matchen är inte färdigrapporterad
+# (FinalResultCreatedTS saknas) och det är högst ~4 timmar sedan kickoff. Är
+# ingen match pågående svaras tomt utan att iBIS anropas alls.
+# ---------------------------------------------------------------------------
+
+def _ongoing_matches(db: Session) -> list[Match]:
+    now = _now_naive()
+    lower = now - timedelta(hours=LIVE_WINDOW_HOURS)
+    rows = db.scalars(
+        select(Match).where(
+            Match.status != "cancelled",
+            Match.kickoff <= now,
+            Match.kickoff >= lower,
+        )
+    ).all()
+    return [m for m in rows if not (m.raw or {}).get("FinalResultCreatedTS")]
+
+
+def _live_match_row(client: IBISClient, m: Match, md: dict, team_id: int) -> dict:
+    ibis_match = IBISMatch.model_validate(md)
+    played = is_played(ibis_match)
+
+    home_id = md.get("HomeTeamID")
+    hemma = None if home_id is None else home_id == team_id
+
+    goals_home = md.get("GoalsHomeTeam")
+    goals_away = md.get("GoalsAwayTeam")
+    resultat = None
+    if played and goals_home is not None and goals_away is not None:
+        resultat = {"hemma": goals_home, "borta": goals_away}
+
+    if resultat is not None and hemma is not None:
+        mal, motstandare_mal = (
+            (resultat["hemma"], resultat["borta"])
+            if hemma
+            else (resultat["borta"], resultat["hemma"])
+        )
+    else:
+        mal = motstandare_mal = None
+
+    spelare: list[dict] = []
+    if played:
+        try:
+            lineups = client.fetch_lineups(m.match_id)
+            for p in get_team_players(lineups, team_id):
+                spelare.append({
+                    "player_id": p.PlayerID,
+                    "mal": p.Goals or 0,
+                    "assist": p.Assists or 0,
+                    "utvisningsminuter": p.PenaltyMinutes or 0,
+                })
+        except ValueError:
+            # Laget finns inte i lineupen än – ta med resultatet ändå.
+            pass
+
+    return {
+        "match_id": m.match_id,
+        "status": _match_status(ibis_match),
+        "hemma": hemma,
+        "mal": mal,
+        "motstandare_mal": motstandare_mal,
+        "resultat": resultat,
+        "spelare": spelare,
+    }
+
+
+def _refresh_live(db: Session, matches: list[Match]) -> dict:
+    client = IBISClient(timeout=LIVE_IBIS_TIMEOUT, max_retries=1)
+
+    by_team: dict[str, list[Match]] = {}
+    for m in matches:
+        by_team.setdefault(m.team, []).append(m)
+
+    rader: list[dict] = []
+    for team_label, team_matches in by_team.items():
+        team_id = _team_id_for(team_label)
+        raw_team = client.fetch_team_raw(settings.season_id, team_id)
+        idx: dict[int, dict] = {}
+        for comp in raw_team.get("Competitions", []):
+            for md in comp.get("Matches", []):
+                idx[md["MatchID"]] = md
+        for m in team_matches:
+            md = idx.get(m.match_id)
+            if md is not None:
+                rader.append(_live_match_row(client, m, md, team_id))
+
+    return {"hamtad": _now_naive().isoformat(), "matcher": rader}
+
+
+@app.get("/api/live")
+def get_live(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_session),
+) -> dict:
+    ongoing = _ongoing_matches(db)
+    if not ongoing:
+        return {"hamtad": _now_naive().isoformat(), "matcher": []}
+
+    now = time.monotonic()
+    with _live_lock:
+        payload = _live_state["payload"]
+        ts = _live_state["ts"]
+        if payload is not None and ts is not None and now - ts < LIVE_TTL_SECONDS:
+            return payload
+        if _live_state["refreshing"]:
+            # Någon annan förfrågan hämtar redan – ge det senaste vi har hellre
+            # än att ringa iBIS en gång till. Tomt om vi inte hämtat än.
+            return payload or {"hamtad": None, "matcher": []}
+        _live_state["refreshing"] = True
+
+    try:
+        fresh = _refresh_live(db, ongoing)
+    except Exception:
+        with _live_lock:
+            stale = _live_state["payload"]
+            _live_state["refreshing"] = False
+        if stale is not None:
+            return stale
+        raise HTTPException(status_code=502, detail="Kunde inte nå iBIS")
+    else:
+        with _live_lock:
+            _live_state["payload"] = fresh
+            _live_state["ts"] = time.monotonic()
+            _live_state["refreshing"] = False
+        return fresh
 
 
 # ---------------------------------------------------------------------------
@@ -723,11 +904,14 @@ def delete_roster_edit(
 # ---------------------------------------------------------------------------
 
 _SHOT_KINDS = ("on_goal", "missed", "blocked")
+_SHOT_SIDES = ("egen", "motstandare")
 
 
 class ShotEventIn(BaseModel):
     id: str
-    player_id: int
+    # null för motståndarens skott – de registreras bara på lagnivå (SPEC 6.1)
+    player_id: int | None = None
+    side: str = "egen"
     kind: str
     period: int
     created_at: str
@@ -752,6 +936,7 @@ def _shot_event_out(e: ShotEvent) -> dict[str, Any]:
         "id": e.id,
         "match_id": e.match_id,
         "player_id": e.player_id,
+        "side": e.side,
         "kind": e.kind,
         "period": e.period,
         "created_at": e.created_at.isoformat() + "Z",
@@ -795,6 +980,13 @@ def post_shot_events(
             raise HTTPException(status_code=422, detail=f"Ogiltig kategori: {h.kind}")
         if h.period not in (1, 2, 3):
             raise HTTPException(status_code=422, detail=f"Ogiltig period: {h.period}")
+        if h.side not in _SHOT_SIDES:
+            raise HTTPException(status_code=422, detail=f"Ogiltig sida: {h.side}")
+        # Egna skott hör till en spelare; motståndarens registreras bara på
+        # lagnivå och har därför ingen spelare (SPEC 6.1).
+        if h.side == "egen" and h.player_id is None:
+            raise HTTPException(status_code=422, detail="Eget skott saknar player_id")
+        player_id = h.player_id if h.side == "egen" else None
 
         deleted_at = _parse_client_ts(h.deleted_at) if h.deleted_at else None
         existing = db.get(ShotEvent, h.id)
@@ -802,7 +994,8 @@ def post_shot_events(
             db.add(ShotEvent(
                 id=h.id,
                 match_id=match_id,
-                player_id=h.player_id,
+                player_id=player_id,
+                side=h.side,
                 kind=h.kind,
                 period=h.period,
                 created_at=_parse_client_ts(h.created_at),

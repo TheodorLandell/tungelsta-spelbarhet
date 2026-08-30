@@ -34,7 +34,8 @@ function sleep(ms) {
 function toWire(e) {
   return {
     id: e.id,
-    player_id: e.player_id,
+    player_id: e.player_id ?? null,
+    side: e.side ?? 'egen',
     kind: e.kind,
     period: e.period,
     created_at: e.created_at,

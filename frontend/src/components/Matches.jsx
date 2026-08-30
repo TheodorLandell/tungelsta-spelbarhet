@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import ShotRegistration from './ShotRegistration'
 import RosterEditor from './RosterEditor'
+import MatchHeader from './MatchHeader'
 import { cacheSquad, loadCachedSquad } from '../lib/shotStore'
 
 function parseKickoff(str) {
@@ -53,11 +54,15 @@ function NonCountingBadge({ label, className = '' }) {
 // Matchlista
 // ---------------------------------------------------------------------------
 
-function MatchListRow({ match, isNext, onSelect, rowRef }) {
+function MatchListRow({ match, isNext, onSelect, rowRef, liveRow }) {
   const installd = match.status === 'cancelled'
-  const spelad = match.status === 'played'
   const ha = homeAwayLabel(match.hemma)
   const typLabel = matchTypeLabel(match)
+
+  // Live-resultat (SPEC 6.6) väger tyngst medan matchen pågår.
+  const liveResultat = liveRow?.resultat ?? null
+  const resultat = liveResultat ?? match.resultat
+  const spelad = match.status === 'played' || Boolean(liveResultat)
 
   return (
     <button
@@ -65,7 +70,7 @@ function MatchListRow({ match, isNext, onSelect, rowRef }) {
       onClick={() => onSelect(match.match_id)}
       className={`w-full text-left px-4 py-3 flex gap-3 items-start
                   hover:bg-gray-50 active:bg-gray-100 transition-colors ${
-                    isNext ? 'bg-blue-50/60' : ''
+                    isNext ? 'bg-orange-50' : ''
                   }`}
     >
       {/* Datum + tid */}
@@ -90,7 +95,7 @@ function MatchListRow({ match, isNext, onSelect, rowRef }) {
           </span>
           {isNext && !installd && (
             <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide
-                             text-blue-700 bg-blue-100 rounded px-1.5 py-0.5">
+                             text-white bg-black rounded px-1.5 py-0.5">
               Nästa
             </span>
           )}
@@ -108,9 +113,15 @@ function MatchListRow({ match, isNext, onSelect, rowRef }) {
                            rounded px-2 py-0.5">
             Inställd
           </span>
-        ) : spelad && match.resultat ? (
+        ) : spelad && resultat ? (
           <span className="text-sm font-bold tabular-nums text-gray-900">
-            {match.resultat.hemma}–{match.resultat.borta}
+            {resultat.hemma}–{resultat.borta}
+            {liveResultat && (
+              <span className="ml-1 align-middle text-[10px] font-bold uppercase
+                               tracking-wide text-tuif-orange">
+                pågår
+              </span>
+            )}
           </span>
         ) : (
           <span className="text-xs text-gray-400">Ej spelad</span>
@@ -120,7 +131,7 @@ function MatchListRow({ match, isNext, onSelect, rowRef }) {
   )
 }
 
-function MatchList({ matches, onSelect }) {
+function MatchList({ matches, onSelect, liveById }) {
   const nextRef = useRef(null)
 
   const now = Date.now()
@@ -155,6 +166,7 @@ function MatchList({ matches, onSelect }) {
           isNext={m.match_id === nextId}
           rowRef={m.match_id === nextId ? nextRef : null}
           onSelect={onSelect}
+          liveRow={liveById?.get(m.match_id) ?? null}
         />
       ))}
     </div>
@@ -166,65 +178,33 @@ function MatchList({ matches, onSelect }) {
 // ---------------------------------------------------------------------------
 
 function MatchDetail({ match, offlineNotice, onUnauthed, onRosterChanged }) {
-  const ha = homeAwayLabel(match.hemma)
-  const spelad = match.spelad
   const typLabel = matchTypeLabel(match)
 
   return (
     <div>
-      {/* Matchhuvud */}
-      <div className="border border-gray-200 rounded-xl bg-white p-4 mb-5">
-        <div className="flex items-start justify-between gap-2">
-          <h2 className="text-lg font-bold text-gray-900 leading-tight">
-            {match.motstandare ?? 'Okänd motståndare'}
-          </h2>
-          {typLabel && <NonCountingBadge label={typLabel} className="mt-1" />}
-        </div>
-        {typLabel && (
-          <p className="text-xs text-purple-700 mt-1">
+      {/* Cup och träningsmatch: markera att den inte räknas i reglerna. Datum,
+          hall och "ej spelad än" hör hemma i matchlistan, inte här (SPEC 6.2). */}
+      {typLabel && (
+        <div className="mb-3 flex items-center gap-2">
+          <NonCountingBadge label={typLabel} />
+          <span className="text-xs text-purple-700">
             Räknas inte i låsningsreglerna. Skott går att registrera som vanligt.
-          </p>
-        )}
-        <p className="text-sm text-gray-500 mt-1">
-          {[
-            formatDay(match.kickoff),
-            match.status !== 'cancelled' && formatTime(match.kickoff),
-            ha,
-          ]
-            .filter(Boolean)
-            .join(' · ')}
-        </p>
-        {match.hall && (
-          <p className="text-sm text-gray-500 mt-0.5">{match.hall}</p>
-        )}
-
-        <div className="mt-3">
-          {match.status === 'cancelled' ? (
-            <span className="text-sm font-semibold text-amber-700 bg-amber-100
-                             rounded-lg px-3 py-1">
-              Inställd match
-            </span>
-          ) : spelad && match.resultat ? (
-            <span className="text-2xl font-bold tabular-nums text-gray-900">
-              {match.resultat.hemma}–{match.resultat.borta}
-            </span>
-          ) : (
-            <span className="text-sm text-gray-400">Ej spelad än</span>
-          )}
+          </span>
         </div>
-      </div>
-
-      {/* Skottregistrering */}
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-2">
-        Skottregistrering
-      </h3>
+      )}
 
       {!match.trupp_publicerad ? (
-        <div className="border border-gray-200 bg-gray-50 rounded-xl px-4 py-6
-                        text-sm text-gray-500 text-center">
-          Truppen är inte publicerad än. Öppna matchen igen när den finns i iBIS
-          så cachas den för offline.
-        </div>
+        <>
+          <MatchHeader match={match} />
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-2">
+            Skottregistrering
+          </h3>
+          <div className="border border-gray-200 bg-gray-50 rounded-xl px-4 py-6
+                          text-sm text-gray-500 text-center">
+            Truppen är inte publicerad än. Öppna matchen igen när den finns i iBIS
+            så cachas den för offline.
+          </div>
+        </>
       ) : (
         <ShotRegistration
           match={match}
@@ -260,13 +240,46 @@ function formatStamp(isoStr) {
   })
 }
 
-export default function MatchesTab({ team, onUnauthed }) {
+// Lägger live-resultatet (SPEC 6.6) ovanpå den hämtade matchvyn: resultatrad,
+// lagmål och spelarnas mål/assist/utvisningsminuter. Rör inte trupp_publicerad,
+// vald period eller något som skottregistreringen äger.
+function mergeLive(detail, liveRow) {
+  if (!detail || !liveRow) return detail
+  const bySpelare = new Map((liveRow.spelare ?? []).map(s => [s.player_id, s]))
+  return {
+    ...detail,
+    status: liveRow.status ?? detail.status,
+    resultat: liveRow.resultat ?? detail.resultat,
+    mal: liveRow.mal ?? detail.mal,
+    motstandare_mal: liveRow.motstandare_mal ?? detail.motstandare_mal,
+    trupp: (detail.trupp ?? []).map(p => {
+      const s = bySpelare.get(p.player_id)
+      return s
+        ? {
+            ...p,
+            mal: s.mal,
+            assist: s.assist,
+            utvisningsminuter: s.utvisningsminuter,
+          }
+        : p
+    }),
+  }
+}
+
+export default function MatchesTab({ team, live, onUnauthed, onInsideMatchChange }) {
   const [matches, setMatches] = useState(null)
   const [selectedId, setSelectedId] = useState(null)
   const [detail, setDetail] = useState(null)
   const [offlineNotice, setOfflineNotice] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+
+  // Låt skalet veta om vi är inne i en match, så meny och lagväljare kan gömmas.
+  useEffect(() => {
+    onInsideMatchChange?.(selectedId != null)
+  }, [selectedId, onInsideMatchChange])
+
+  useEffect(() => () => onInsideMatchChange?.(false), [onInsideMatchChange])
 
   const loadList = useCallback(async () => {
     setLoading(true)
@@ -369,7 +382,8 @@ export default function MatchesTab({ team, onUnauthed }) {
         {selectedId != null && (
           <button
             onClick={() => setSelectedId(null)}
-            className="mb-4 text-sm text-blue-700 hover:text-blue-800"
+            className="mb-4 text-sm font-medium text-black underline underline-offset-2
+                       hover:text-gray-700"
           >
             ‹ Matchlista
           </button>
@@ -393,18 +407,21 @@ export default function MatchesTab({ team, onUnauthed }) {
     return <p className="text-sm text-gray-500 px-4 py-6 text-center">Laddar...</p>
   }
 
+  const liveById = new Map((live?.matcher ?? []).map(m => [m.match_id, m]))
+
   if (selectedId != null) {
     return (
       <div>
         <button
           onClick={() => setSelectedId(null)}
-          className="mb-4 text-sm text-blue-700 hover:text-blue-800 font-medium"
+          className="mb-4 text-sm font-medium text-black underline underline-offset-2
+                     hover:text-gray-700"
         >
           ‹ Matchlista
         </button>
         {detail && (
           <MatchDetail
-            match={detail}
+            match={mergeLive(detail, liveById.get(selectedId))}
             offlineNotice={offlineNotice}
             onUnauthed={onUnauthed}
             onRosterChanged={() => loadDetail(selectedId)}
@@ -414,5 +431,11 @@ export default function MatchesTab({ team, onUnauthed }) {
     )
   }
 
-  return <MatchList matches={matches ?? []} onSelect={setSelectedId} />
+  return (
+    <MatchList
+      matches={matches ?? []}
+      onSelect={setSelectedId}
+      liveById={liveById}
+    />
+  )
 }

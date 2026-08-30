@@ -6,13 +6,13 @@ import {
   loadEvents,
   addEvent,
   tombstoneLatest,
-  tombstoneMostRecent,
   countActive,
+  countSide,
   canRegisterInPeriod,
   unsyncedCount,
-  feedRows,
 } from '../lib/shotStore'
 import { syncMatch, SyncError } from '../lib/shotSync'
+import MatchHeader from './MatchHeader'
 
 const PERIODS = [1, 2, 3]
 const NAME_KEY = 'tranare_kortnamn'
@@ -81,12 +81,12 @@ function CategoryControl({ kind, count, onPlus, onMinus, disabled, readOnly }) {
   if (readOnly) {
     // Matchöversikt – bara siffran, inga knappar. Går inte att registrera i.
     return (
-      <div className="flex flex-col items-center rounded-xl border border-slate-200
+      <div className="flex flex-col items-center rounded-xl border border-gray-300
                       bg-white px-2 py-3">
         <span className="text-[11px] font-medium text-gray-500 text-center mb-1 leading-tight">
           {KIND_LABEL[kind]}
         </span>
-        <span className="text-2xl font-bold tabular-nums text-slate-700">{count}</span>
+        <span className="text-2xl font-bold tabular-nums text-gray-800">{count}</span>
       </div>
     )
   }
@@ -100,10 +100,11 @@ function CategoryControl({ kind, count, onPlus, onMinus, disabled, readOnly }) {
         onClick={onPlus}
         disabled={disabled}
         aria-label={`Lägg till ${KIND_LABEL[kind].toLowerCase()}`}
-        className="h-16 rounded-xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800
-                   text-white font-bold tabular-nums text-2xl
+        className="h-16 rounded-xl bg-tuif-orange text-black
+                   hover:brightness-95 active:brightness-90
+                   font-bold tabular-nums text-2xl
                    flex items-center justify-center gap-2
-                   disabled:opacity-40 disabled:cursor-not-allowed transition-colors
+                   disabled:opacity-40 disabled:cursor-not-allowed transition
                    select-none touch-manipulation"
       >
         <span className="text-lg font-normal opacity-80">+</span>
@@ -147,7 +148,7 @@ function PlayerCard({
   const total = (malKnown ? malFromIbis : 0) + tOnGoal + tMissed + tBlocked
 
   return (
-    <div className={`px-3 py-3 ${overview ? 'bg-slate-50/70' : ''}`}>
+    <div className={`px-3 py-3 ${overview ? 'bg-gray-50' : ''}`}>
       <div className="flex items-center gap-2 mb-2">
         <span className="w-7 shrink-0 text-right text-sm text-gray-400 tabular-nums select-none">
           {player.trojnummer != null ? player.trojnummer : ''}
@@ -157,7 +158,7 @@ function PlayerCard({
           {player.malvakt && (
             <span
               className="ml-2 text-[10px] font-bold uppercase tracking-wide
-                         text-indigo-700 bg-indigo-100 rounded px-1.5 py-0.5 align-middle"
+                         text-white bg-black rounded px-1.5 py-0.5 align-middle"
             >
               MV
             </span>
@@ -183,10 +184,7 @@ function PlayerCard({
         {/* Totala skott – räknas fram, knappas aldrig in */}
         <span className="shrink-0 flex items-center gap-1.5 text-xs">
           <span className="text-gray-400">Totalt</span>
-          <span className="font-bold tabular-nums text-gray-900">
-            {total}
-            {!malKnown && <span className="text-amber-500">*</span>}
-          </span>
+          <span className="font-bold tabular-nums text-gray-900">{total}</span>
         </span>
       </div>
 
@@ -228,8 +226,8 @@ function SyncStatusRow({ syncState, osynkade, online }) {
       'Ingen anslutning. Registreringar sparas lokalt och synkas när nätet är tillbaka.' +
       vantar
   } else if (syncState === 'syncing') {
-    dot = 'bg-blue-500 animate-pulse'
-    wrap = 'text-blue-800 bg-blue-50 border-blue-200'
+    dot = 'bg-black animate-pulse'
+    wrap = 'text-gray-800 bg-gray-100 border-gray-300'
     text = 'Synkar...'
   } else if (syncState === 'error') {
     dot = 'bg-amber-500'
@@ -251,31 +249,6 @@ function SyncStatusRow({ syncState, osynkade, online }) {
     >
       <span className={`w-2 h-2 rounded-full shrink-0 ${dot}`} />
       <span>{text}</span>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Senaste registreringen – en kompakt rad med ångra (SPEC 6.4)
-// ---------------------------------------------------------------------------
-
-function LastRegistration({ row, onUndo }) {
-  if (!row) return null
-  return (
-    <div className="mt-2 flex items-center gap-2 text-xs border border-gray-200
-                    rounded-lg bg-white px-3 py-1.5">
-      <span className="text-gray-400 shrink-0">Senast</span>
-      <span className="font-medium text-gray-900 truncate">{row.namn}</span>
-      <span className="text-gray-500 shrink-0">{row.kategori}</span>
-      <span className="text-gray-400 shrink-0">{row.av}</span>
-      <button
-        onClick={onUndo}
-        className="ml-auto shrink-0 px-2 py-0.5 rounded-md bg-gray-100 hover:bg-gray-200
-                   active:bg-gray-300 text-gray-700 font-semibold transition-colors
-                   touch-manipulation"
-      >
-        Ångra
-      </button>
     </div>
   )
 }
@@ -432,49 +405,105 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
     [matchId, period, runSync],
   )
 
-  // Ångrar den allra senaste registreringen, oavsett spelare och period.
-  const handleUndoLast = useCallback(async () => {
-    try {
-      const updated = await tombstoneMostRecent(matchId)
-      if (updated) {
-        setEvents(prev =>
-          (prev ?? []).map(e => (e.id === updated.id ? updated : e)),
-        )
+  // Motståndarens skott – bara på lagnivå, ingen spelare (SPEC 6.1). Samma
+  // periodtaggning, samma local-first lagring och synk som spelarnas.
+  const handleOpponentPlus = useCallback(
+    async kind => {
+      if (!canRegisterInPeriod(period)) return
+      try {
+        const ev = await addEvent({
+          matchId,
+          playerId: null,
+          kind,
+          period,
+          createdBy: name,
+          side: 'motstandare',
+        })
+        setEvents(prev => [...(prev ?? []), ev])
         runSync()
+      } catch {
+        setLoadError(true)
       }
-    } catch {
-      setLoadError(true)
-    }
-  }, [matchId, runSync])
+    },
+    [matchId, period, name, runSync],
+  )
+
+  const handleOpponentMinus = useCallback(
+    async kind => {
+      if (!canRegisterInPeriod(period)) return
+      try {
+        const updated = await tombstoneLatest({
+          matchId,
+          playerId: null,
+          kind,
+          period,
+          side: 'motstandare',
+        })
+        if (updated) {
+          setEvents(prev =>
+            (prev ?? []).map(e => (e.id === updated.id ? updated : e)),
+          )
+          runSync()
+        }
+      } catch {
+        setLoadError(true)
+      }
+    },
+    [matchId, period, runSync],
+  )
+
+
+  const overview = !canRegisterInPeriod(period)
+
+  // Matchhuvud (SPEC 6.2): resultatrad plus lagstatistik som följer vald period,
+  // inklusive "Hela matchen". Visas i alla lägen, även innan registreringarna
+  // laddats.
+  const header = (
+    <MatchHeader
+      match={match}
+      ownShots={countSide(events ?? [], 'egen', period)}
+      oppShots={countSide(events ?? [], 'motstandare', period)}
+    />
+  )
 
   if (loadError) {
     return (
-      <div className="border border-red-200 bg-red-50 rounded-xl px-4 py-6
-                      text-sm text-red-700 text-center">
-        Kunde inte läsa den lokala lagringen på den här enheten. Registrering är
-        inte möjlig just nu.
+      <div>
+        {header}
+        <div className="border border-red-200 bg-red-50 rounded-xl px-4 py-6
+                        text-sm text-red-700 text-center">
+          Kunde inte läsa den lokala lagringen på den här enheten. Registrering är
+          inte möjlig just nu.
+        </div>
       </div>
     )
   }
 
   if (events === null) {
     return (
-      <p className="text-sm text-gray-500 px-4 py-6 text-center">
-        Laddar registreringar...
-      </p>
+      <div>
+        {header}
+        <p className="text-sm text-gray-500 px-4 py-6 text-center">
+          Laddar registreringar...
+        </p>
+      </div>
     )
   }
 
-  const overview = !canRegisterInPeriod(period)
   const counts = countActive(events, period) // vald period, eller alla i översikten
   const totalCounts = countActive(events) // alltid hela matchen, för "Totalt"
+  const oppCounts = countSide(events, 'motstandare', period) // motståndaren, vald period
   const osynkade = unsyncedCount(events)
   const malById = new Map(trupp.map(p => [p.player_id, p.mal]))
-  const namesById = new Map(trupp.map(p => [p.player_id, p.namn]))
-  const lastReg = feedRows(events, namesById, 1)[0] ?? null
 
   return (
     <div>
+      {header}
+
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-2">
+        Skottregistrering
+      </h3>
+
       {/* Statusrad: speglar vad synken faktiskt gör */}
       <div className="mb-2 space-y-1.5">
         <SyncStatusRow syncState={syncState} osynkade={osynkade} online={online} />
@@ -509,11 +538,11 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
               key={p}
               onClick={() => changePeriod(p)}
               aria-pressed={period === p}
-              className={`flex-1 h-11 rounded-xl text-base font-bold transition-colors
-                          select-none touch-manipulation ${
+              className={`flex-1 h-12 rounded-xl text-base font-bold transition
+                          select-none touch-manipulation border ${
                             period === p
-                              ? 'bg-blue-600 text-white ring-2 ring-blue-600 ring-offset-1'
-                              : 'bg-white text-gray-500 border border-gray-300 hover:border-blue-400'
+                              ? 'bg-tuif-orange text-black border-transparent'
+                              : 'bg-white text-gray-500 border-gray-200 hover:bg-gray-50'
                           }`}
             >
               P{p}
@@ -523,11 +552,11 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
           <button
             onClick={() => changePeriod(OVERVIEW)}
             aria-pressed={overview}
-            className={`flex-1 h-11 rounded-xl text-xs font-bold transition-colors
-                        select-none touch-manipulation ${
+            className={`flex-1 h-12 rounded-xl text-xs font-bold transition
+                        select-none touch-manipulation border border-dashed ${
                           overview
-                            ? 'bg-slate-700 text-white ring-2 ring-slate-700 ring-offset-1'
-                            : 'bg-white text-gray-500 border border-dashed border-gray-300 hover:border-slate-400'
+                            ? 'bg-tuif-orange text-black border-transparent'
+                            : 'bg-white text-gray-500 border-gray-300 hover:bg-gray-50'
                         }`}
           >
             Hela matchen
@@ -535,7 +564,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
         </div>
 
         {overview ? (
-          <p className="text-xs text-slate-700 mt-1.5">
+          <p className="text-xs text-gray-700 mt-1.5">
             Översikt över hela matchen, skrivskyddad. Välj P1, P2 eller P3 för att
             registrera.
           </p>
@@ -547,17 +576,42 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
         )}
       </div>
 
-      {/* Senaste registreringen – kompakt, med ångra */}
-      {!overview && <LastRegistration row={lastReg} onUndo={handleUndoLast} />}
+      {/* Motståndarens skott – bara på lagnivå (SPEC 6.1). Formgivet som ett
+          spelarkort med lagnamnet där spelarnamnet står, och placerat ovanför
+          spelarlistan. Samma tre kategorier, knappar, periodtaggning och synk. */}
+      <div className={`border rounded-xl bg-white overflow-hidden mt-2 ${
+                        overview ? 'border-gray-400' : 'border-gray-200'
+                      }`}>
+        <div className="px-3 py-3">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="flex-1 min-w-0 text-sm font-medium text-gray-900 truncate">
+              {match.motstandare ?? 'Motståndaren'}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            {KINDS.map(kind => (
+              <CategoryControl
+                key={kind}
+                kind={kind}
+                count={oppCounts[kind] || 0}
+                onPlus={() => handleOpponentPlus(kind)}
+                onMinus={() => handleOpponentMinus(kind)}
+                disabled={!name}
+                readOnly={overview}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
 
       {/* Spelarlista */}
       <div className={`border rounded-xl bg-white divide-y divide-gray-100
-                      overflow-hidden mt-2 ${
-                        overview ? 'border-slate-300' : 'border-gray-200'
+                      overflow-hidden mt-4 ${
+                        overview ? 'border-gray-400' : 'border-gray-200'
                       }`}>
         {overview && (
-          <div className="px-3 py-2 bg-slate-100 text-[11px] font-semibold uppercase
-                          tracking-wide text-slate-600">
+          <div className="px-3 py-2 bg-gray-100 text-[11px] font-semibold uppercase
+                          tracking-wide text-gray-600">
             Översikt · hela matchen · skrivskyddat
           </div>
         )}
@@ -575,11 +629,6 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
           />
         ))}
       </div>
-
-      <p className="text-xs text-gray-400 mt-2">
-        Mål hämtas från iBIS. <span className="text-amber-500">*</span> = ännu
-        inte hämtade, totalen preliminär.
-      </p>
     </div>
   )
 }

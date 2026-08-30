@@ -91,13 +91,23 @@ export async function loadEvents(matchId) {
   return rows.sort((a, b) => a.created_at.localeCompare(b.created_at))
 }
 
-export async function addEvent({ matchId, playerId, kind, period, createdBy }) {
+// side: 'egen' (skott för en av våra spelare) eller 'motstandare' (skott på
+// lagnivå för motståndarlaget, SPEC 6.1). För 'motstandare' är playerId null.
+export async function addEvent({
+  matchId,
+  playerId,
+  kind,
+  period,
+  createdBy,
+  side = 'egen',
+}) {
   if (!KINDS.includes(kind)) throw new Error(`Okänd kategori: ${kind}`)
   const now = new Date().toISOString()
   const event = {
     id: newId(),
     match_id: matchId,
-    player_id: playerId,
+    player_id: side === 'motstandare' ? null : playerId,
+    side,
     kind,
     period,
     created_at: now,
@@ -112,36 +122,25 @@ export async function addEvent({ matchId, playerId, kind, period, createdBy }) {
 }
 
 // Borttagning = tombstone på den senaste aktiva händelsen för
-// (spelare, kategori, period). Ingen rad raderas.
-export async function tombstoneLatest({ matchId, playerId, kind, period }) {
+// (sida, spelare, kategori, period). Ingen rad raderas. För motståndaren är
+// playerId null och side 'motstandare'.
+export async function tombstoneLatest({
+  matchId,
+  playerId,
+  kind,
+  period,
+  side = 'egen',
+}) {
   const events = await loadEvents(matchId)
   const active = events
     .filter(
       e =>
-        e.player_id === playerId &&
+        (e.side || 'egen') === side &&
+        e.player_id === (side === 'motstandare' ? null : playerId) &&
         e.kind === kind &&
         e.period === period &&
         !e.deleted_at,
     )
-    .sort((a, b) => a.created_at.localeCompare(b.created_at))
-
-  const target = active[active.length - 1]
-  if (!target) return null
-
-  const updated = { ...target, deleted_at: new Date().toISOString(), synced_at: null }
-  const db = await openDb()
-  const store = tx(db, STORE_EVENTS, 'readwrite')
-  await toPromise(store.put(updated))
-  return updated
-}
-
-// Ångrar den allra senaste aktiva registreringen i matchen, oavsett spelare,
-// kategori och period. Driver den kompakta ångra-knappen i registreringsvyn.
-// Som all borttagning: en tombstone, ingen rad raderas.
-export async function tombstoneMostRecent(matchId) {
-  const events = await loadEvents(matchId)
-  const active = events
-    .filter(e => !e.deleted_at)
     .sort((a, b) => a.created_at.localeCompare(b.created_at))
 
   const target = active[active.length - 1]
@@ -206,8 +205,9 @@ export async function loadCachedSquad(matchId) {
 // Härledda värden
 // ---------------------------------------------------------------------------
 
-// Räknar aktiva (ej tombstonade) händelser per spelare och kategori.
-// Nyckel: `${player_id}:${kind}` -> antal.
+// Räknar aktiva (ej tombstonade) skott för de egna spelarna per spelare och
+// kategori. Nyckel: `${player_id}:${kind}` -> antal. Motståndarens skott
+// (side 'motstandare') räknas aldrig här – de hör inte till någon spelare.
 //
 // Med period 1, 2 eller 3 räknas bara den periodens händelser, så siffran på
 // plusknappen alltid speglar vald period. Utan period, eller med OVERVIEW,
@@ -217,9 +217,26 @@ export function countActive(events, period) {
   const counts = new Map()
   for (const e of events) {
     if (e.deleted_at) continue
+    if ((e.side || 'egen') === 'motstandare') continue
     if (perPeriod && e.period !== period) continue
     const key = `${e.player_id}:${e.kind}`
     counts.set(key, (counts.get(key) || 0) + 1)
+  }
+  return counts
+}
+
+// Summerar aktiva skott för en sida ('egen' eller 'motstandare') per kategori,
+// för matchhuvudets lagrader (SPEC 6.2). Följer vald period precis som
+// spelarnas siffror; utan period eller med OVERVIEW räknas hela matchen.
+export function countSide(events, side, period) {
+  const perPeriod = period === 1 || period === 2 || period === 3
+  const counts = { on_goal: 0, missed: 0, blocked: 0 }
+  for (const e of events) {
+    if (e.deleted_at) continue
+    if ((e.side || 'egen') !== side) continue
+    if (perPeriod && e.period !== period) continue
+    if (counts[e.kind] === undefined) continue
+    counts[e.kind] += 1
   }
   return counts
 }
@@ -257,7 +274,8 @@ export function reconcileRemote(local, remote, stamp = new Date().toISOString())
       out.push({
         id: r.id,
         match_id: r.match_id,
-        player_id: r.player_id,
+        player_id: r.player_id ?? null,
+        side: r.side ?? 'egen',
         kind: r.kind,
         period: Number(r.period),
         created_at: r.created_at,
@@ -285,7 +303,7 @@ export function reconcileRemote(local, remote, stamp = new Date().toISOString())
 // Flödesrad (SPEC 6.4): de senaste registreringarna, nyast först
 // ---------------------------------------------------------------------------
 
-export function feedRows(events, namesById, limit = 12) {
+export function feedRows(events, namesById, limit = 12, opponentName = null) {
   return events
     .filter(e => !e.deleted_at)
     .slice()
@@ -294,7 +312,10 @@ export function feedRows(events, namesById, limit = 12) {
     .map(e => ({
       id: e.id,
       namn:
-        (namesById && namesById.get(e.player_id)) || `Spelare ${e.player_id}`,
+        (e.side || 'egen') === 'motstandare'
+          ? opponentName || 'Motståndaren'
+          : (namesById && namesById.get(e.player_id)) ||
+            `Spelare ${e.player_id}`,
       kategori: KIND_LABEL[e.kind] || e.kind,
       period: e.period,
       av: e.created_by || 'okänd',

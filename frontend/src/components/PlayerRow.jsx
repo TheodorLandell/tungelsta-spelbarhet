@@ -29,7 +29,7 @@ function Badge({ children, variant }) {
     warning: 'bg-amber-500 text-white',
     green: 'bg-green-600 text-white',
     yellow: 'bg-yellow-400 text-yellow-900',
-    blue: 'bg-blue-600 text-white',
+    blue: 'bg-black text-white',
     red: 'bg-red-600 text-white',
   }
   return (
@@ -149,7 +149,7 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
           {/* Override info – alltid synlig när override finns */}
           {ovr && !pendingKind && (
             <div className="mt-1.5 space-y-0.5">
-              <p className="text-xs text-indigo-600">
+              <p className="text-xs text-gray-700">
                 Ändrad manuellt: {ovr.note} · {formatOverrideDate(ovr.created_at)}
               </p>
               {ovr.stale && (
@@ -162,7 +162,7 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
 
           {/* Manuellt ändrad matchlista – markeras som overrides (SPEC 6.5) */}
           {player.roster_edit && !pendingKind && (
-            <p className="text-xs text-indigo-600 mt-1">
+            <p className="text-xs text-gray-700 mt-1">
               Underlaget manuellt ändrat:{' '}
               {player.roster_edit.action === 'add'
                 ? 'spelare tillagd i en matchtrupp'
@@ -183,8 +183,8 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
               {isLocked && ovr?.kind !== 'lock' && (
                 <button
                   onClick={() => { setPendingKind('unlock'); setPendingValue(null) }}
-                  className="text-xs px-2.5 py-1 bg-blue-50 border border-blue-200
-                             text-blue-700 rounded-lg hover:bg-blue-100 transition-colors"
+                  className="text-xs px-2.5 py-1 bg-tuif-orange text-black rounded-lg
+                             hover:brightness-95 active:brightness-90 transition"
                 >
                   Lås upp
                 </button>
@@ -196,10 +196,10 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
                   key={n}
                   onClick={() => { setPendingKind('set_matches_left'); setPendingValue(n) }}
                   disabled={player.matcher_kvar === n}
-                  className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
+                  className={`text-xs px-2.5 py-1 rounded-lg border transition ${
                     player.matcher_kvar === n
                       ? 'bg-gray-100 border-gray-200 text-gray-400 cursor-default'
-                      : 'bg-white border-gray-300 text-gray-700 hover:border-blue-400 hover:text-blue-700'
+                      : 'bg-tuif-orange border-transparent text-black hover:brightness-95 active:brightness-90'
                   }`}
                 >
                   {n} kvar
@@ -239,16 +239,17 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
                 value={note}
                 onChange={e => setNote(e.target.value)}
                 onKeyDown={e => { if (e.key === 'Enter' && note.trim() && !busy) confirm() }}
-                className="w-full text-xs border border-gray-300 rounded-lg px-2.5 py-1.5
-                           focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full text-xs border-2 border-gray-300 rounded-lg px-2.5 py-1.5
+                           focus:outline-none focus:border-black focus:ring-2 focus:ring-black"
                 autoFocus
               />
               <div className="flex gap-2">
                 <button
                   onClick={confirm}
                   disabled={busy || !note.trim()}
-                  className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded-lg
-                             disabled:opacity-50 hover:bg-blue-700 transition-colors"
+                  className="text-xs px-3 py-1.5 bg-tuif-orange text-black
+                             rounded-lg disabled:opacity-50 hover:brightness-95
+                             active:brightness-90 transition"
                 >
                   {busy ? 'Sparar...' : 'Bekräfta'}
                 </button>

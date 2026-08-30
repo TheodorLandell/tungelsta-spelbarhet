@@ -6,6 +6,7 @@ import assert from 'node:assert/strict'
 
 import {
   countActive,
+  countSide,
   canRegisterInPeriod,
   OVERVIEW,
   reconcileRemote,
@@ -69,6 +70,68 @@ test('tombstonad händelse räknas inte i någon vy', () => {
   const events = [ev({ period: 1, deleted_at: new Date().toISOString() })]
   assert.equal(countActive(events, 1).get('10:on_goal') ?? 0, 0)
   assert.equal(countActive(events, OVERVIEW).get('10:on_goal') ?? 0, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Motståndarens skott (SPEC 6.1) – side 'motstandare', ingen spelare
+// ---------------------------------------------------------------------------
+
+test('countActive räknar aldrig motståndarens skott på en spelare', () => {
+  const events = [
+    ev({ side: 'egen', kind: 'on_goal', period: 1 }),
+    ev({ side: 'motstandare', player_id: null, kind: 'on_goal', period: 1 }),
+  ]
+  assert.equal(countActive(events, 1).get('10:on_goal'), 1)
+  assert.equal(countActive(events, OVERVIEW).get('null:on_goal') ?? 0, 0)
+})
+
+test('countSide summerar per sida och följer vald period', () => {
+  const events = [
+    ev({ side: 'egen', kind: 'on_goal', period: 1 }),
+    ev({ side: 'egen', kind: 'missed', period: 2 }),
+    ev({ side: 'motstandare', player_id: null, kind: 'on_goal', period: 1 }),
+    ev({ side: 'motstandare', player_id: null, kind: 'blocked', period: 1 }),
+    ev({ side: 'motstandare', player_id: null, kind: 'on_goal', period: 2 }),
+  ]
+
+  // Egna, hela matchen
+  assert.deepEqual(countSide(events, 'egen', OVERVIEW), {
+    on_goal: 1,
+    missed: 1,
+    blocked: 0,
+  })
+  // Motståndaren, bara P1
+  assert.deepEqual(countSide(events, 'motstandare', 1), {
+    on_goal: 1,
+    missed: 0,
+    blocked: 1,
+  })
+  // Motståndaren, hela matchen
+  assert.deepEqual(countSide(events, 'motstandare', OVERVIEW), {
+    on_goal: 2,
+    missed: 0,
+    blocked: 1,
+  })
+})
+
+test('countSide räknar inte tombstonade skott', () => {
+  const events = [
+    ev({ side: 'motstandare', player_id: null, kind: 'on_goal', period: 1 }),
+    ev({
+      side: 'motstandare',
+      player_id: null,
+      kind: 'on_goal',
+      period: 1,
+      deleted_at: new Date().toISOString(),
+    }),
+  ]
+  assert.equal(countSide(events, 'motstandare', 1).on_goal, 1)
+})
+
+test('händelse utan side räknas som egen (bakåtkompatibelt)', () => {
+  const events = [ev({ kind: 'on_goal', period: 1 })] // ingen side
+  assert.equal(countSide(events, 'egen', 1).on_goal, 1)
+  assert.equal(countSide(events, 'motstandare', 1).on_goal, 0)
 })
 
 // ---------------------------------------------------------------------------
@@ -150,6 +213,28 @@ test('feedRows: nyast först, med namn, kategori, period och vem som tryckte', (
   assert.equal(rows[0].kategori, 'Skott utanför')
   assert.equal(rows[0].period, 2)
   assert.equal(rows[0].av, 'Anna')
+})
+
+test('feedRows: motståndarens skott får motståndarnamnet, inte ett spelarnamn', () => {
+  const events = [
+    ev({
+      id: '1',
+      side: 'motstandare',
+      player_id: null,
+      kind: 'blocked',
+      created_at: '2026-08-28T19:00:00.000Z',
+      created_by: 'Theo',
+    }),
+  ]
+  const rows = feedRows(events, new Map(), 12, 'Hammarby IF IBF Herr A')
+  assert.equal(rows[0].namn, 'Hammarby IF IBF Herr A')
+  assert.equal(rows[0].kategori, 'Skott i täck')
+  assert.equal(rows[0].av, 'Theo')
+})
+
+test('feedRows: motståndarskott utan angivet namn får en reserv', () => {
+  const events = [ev({ side: 'motstandare', player_id: null })]
+  assert.equal(feedRows(events, new Map())[0].namn, 'Motståndaren')
 })
 
 test('feedRows: tombstonade utelämnas, okänt namn får reserv, limit respekteras', () => {

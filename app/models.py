@@ -122,6 +122,10 @@ class ShotEvent(Base):
     skapas på klienten, så att samma händelse kan skickas flera gånger utan att
     bli en dubblett. Borttagning är en tombstone (deleted_at), aldrig en radering.
     created_by är tränarens kortnamn från klienten.
+
+    side skiljer det egna laget från motståndaren. Motståndarens skott
+    registreras bara på lagnivå (SPEC 6.1), så player_id är null för
+    side == 'motstandare' och satt för side == 'egen'.
     """
 
     __tablename__ = "shot_events"
@@ -130,7 +134,12 @@ class ShotEvent(Base):
     match_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("matches.match_id"), index=True
     )
-    player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.player_id"))
+    player_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("players.player_id"), nullable=True
+    )
+    side: Mapped[str] = mapped_column(          # 'egen' | 'motstandare'
+        String(16), default="egen", server_default="egen"
+    )
     kind: Mapped[str] = mapped_column(String(16))          # 'on_goal' | 'missed' | 'blocked'
     period: Mapped[int] = mapped_column(Integer)           # 1 | 2 | 3
     created_at: Mapped[datetime] = mapped_column(DateTime)

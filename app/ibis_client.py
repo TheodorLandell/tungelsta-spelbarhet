@@ -160,9 +160,18 @@ def get_team_players(lineups: IBISLineups, team_id: int) -> list[IBISMatchPlayer
 class IBISClient:
     """Klient som hanterar token, retry och paus mellan anrop."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = TIMEOUT,
+        max_retries: int = MAX_RETRIES,
+    ) -> None:
         self._token: str | None = None
         self._token_expiry: datetime | None = None
+        # Live-endpointen (SPEC 6.6) skickar en klient med kort timeout och
+        # utan omförsök, så att en trög iBIS aldrig får klienten att hänga.
+        self._timeout = timeout
+        self._max_retries = max_retries
 
     def _ensure_token(self) -> str:
         now = datetime.now(tz=timezone.utc)
@@ -179,13 +188,13 @@ class IBISClient:
 
     def _raw_get(self, url: str, headers: dict | None = None) -> httpx.Response:
         h = {"Origin": STATS_ORIGIN, "Referer": f"{STATS_ORIGIN}/", **(headers or {})}
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(self._max_retries):
             try:
-                resp = httpx.get(url, headers=h, timeout=TIMEOUT)
+                resp = httpx.get(url, headers=h, timeout=self._timeout)
                 resp.raise_for_status()
                 return resp
             except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                if attempt == MAX_RETRIES - 1:
+                if attempt == self._max_retries - 1:
                     raise
                 backoff = 2 ** attempt
                 time.sleep(backoff)

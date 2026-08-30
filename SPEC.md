@@ -185,7 +185,8 @@ players
 shot_events
   id                PK, UUID skapad på klienten
   match_id          FK
-  player_id         FK
+  player_id         FK, null för motståndarens skott
+  side              'egen' | 'motstandare'
   kind              'on_goal' | 'missed' | 'blocked'
   period            1 | 2 | 3
   created_at        datetime
@@ -221,12 +222,20 @@ SQLite räcker. En säsong är cirka 40 matcher och 54 spelare.
 
 ## 5. Del 1 – Spelbarhet
 
-Redan byggd. Två tillägg:
+Redan byggd. Ändringar:
 
 - Redigeringsläget ska kunna **både låsa och låsa upp** en spelare, inte bara
   låsa upp
-- Lagväljaren högst upp gäller hela appen och styr vilken match- och
-  spelarlista som visas
+- Vyn visar **en samlad lista över alla spelare, oberoende av lag**. Lagväljaren
+  A/B hör hemma i matchlistan och statistiken, inte här och inte inne i en
+  match.
+- Menyn Spelbarhet / Matcher / Statistik göms när man är inne i en enskild
+  match – tillbaka-länken i matchvyn räcker.
+- Bara spelare som stått i truppen i en **spelad seriematch** tas med, inte hela
+  den registrerade truppen. Undantag: en spelare med en aktiv override visas
+  även utan spelad match, eftersom det är en medveten åtgärd av tränaren.
+- Listan får vara tom innan säsongen har börjat. Då ska vyn säga varför (inga
+  spelade matcher än, eller ingen synk gjord), inte se trasig ut.
 
 I övrigt oförändrad: grupperad lista (måste stå över / tillgängliga / låsta),
 skrivskyddad tills redigera-knappen aktiveras, overrides som appliceras efter
@@ -247,7 +256,18 @@ Per match: datum, tid, motståndare, hemma/borta, hall, resultat om spelat.
 ### 6.2 Registreringsvyn
 
 Öppnas genom att klicka på en match. Visar matchens trupp och låter tränaren
-registrera skott per spelare.
+registrera skott per spelare, plus motståndarens skott på lagnivå.
+
+**Matchhuvud.** Ingen box och ingen ram. Överst en resultatrad i klassisk stil:
+hemmalag, mål, mål, bortalag på en rad, med lagnamn och siffror betydligt större
+än brödtexten. Direkt under respektive lagnamn en liten rad med lagets skott:
+skott totalt, på mål, utanför, i täck – bara antal, inga andelar, ingen stjärna.
+Lagstatistiken följer vald period precis som spelarnas, inklusive läget "Hela
+matchen". Totala skott = mål + på mål + utanför + i täck, som för spelarna. Före
+matchen är resultatet blankt – inga platshållarrutor med streck. När iBIS
+rapporterat visas siffrorna, även 0-0; live-uppdateringen (6.6) fyller dem under
+matchens gång. Datum, hall och "ej spelad än" hör hemma i matchlistan och visas
+inte i huvudet.
 
 **Tre kategorier registreras manuellt:**
 
@@ -256,7 +276,8 @@ registrera skott per spelare.
 - `blocked` – skott i täck
 
 **Mål registreras inte manuellt.** De hämtas från iBIS och är en egen kategori.
-Tränaren ska alltså *inte* trycka när ett skott går in.
+Tränaren ska alltså *inte* trycka när ett skott går in. Detsamma gäller
+motståndarens mål: de hämtas från iBIS som våra egna, aldrig manuellt.
 
 **Totala skott** = mål + skott på mål + skott utanför + skott i täck. Räknas fram,
 knappas aldrig in.
@@ -265,15 +286,25 @@ knappas aldrig in.
 en smalare minusknapp under. Plus är den vanliga handlingen och ska gå att träffa
 med tummen utan att titta. Minus finns tillgängligt men tar mindre plats.
 
+**Motståndarens skott** registreras på lagnivå, inte per spelare. Blocket formges
+exakt som ett spelarkort – motståndarens namn där spelarnamnet står, sedan samma
+tre kategorier med plus- och minusknappar – och ligger ovanför spelarlistan.
+Ingen egen rubrik; lagnamnet räcker. Samma periodtaggning och samma local-first
+lagring och synk som spelarnas. På `shot_events` bär raderna
+`side = 'motstandare'` och har inget `player_id`.
+
 **Periodväljare** överst med P1, P2, P3. Den **taggar** registreringen: det som
 trycks medan P2 är valt sparas som period 2. Vald period ska synas tydligt, och
 appen bör påminna vid periodbyte eftersom det annars är lätt att glömma.
 
 **Målvakter** visas i listan som alla andra, markerade med MV.
 
-**Målrutan är tom under matchen** eftersom målen kommer från iBIS med fördröjning.
-Det ska framgå tydligt att totalen och procenten är ofullständiga tills synk skett,
-inte se ut som att spelarna saknar mål.
+**Målrutan är tom tills målen finns** eftersom målen kommer från iBIS. I
+matchhuvudet betyder det ett blankt resultat tills något rapporterats; i
+spelarlistan en tom målruta, inte en nolla, så att det inte ser ut som att
+spelaren saknar mål. Ingen stjärna och ingen förklarande fotnot – live-
+uppdateringen (6.6) fyller siffrorna under matchen och nattjobbet stämmer av
+resten.
 
 ### 6.3 Local-first
 
@@ -294,7 +325,8 @@ Registreringar laddas upp direkt och andra enheter hämtar dem, så tränarna se
 varandras inmatning.
 
 En liten flödesrad visar de senaste registreringarna med spelare, kategori och
-vem som tryckte. Den gör det lätt att se vad den andra gjort och att ångra fel.
+vem som tryckte. Motståndarens skott visas där med motståndarens namn i stället
+för ett spelarnamn. Den gör det lätt att se vad den andra gjort och att ångra fel.
 
 Tekniska dubbletter är omöjliga tack vare klient-UUID. Att två personer
 registrerar samma skott är ett mänskligt problem som flödesraden ska göra synligt.
@@ -317,6 +349,32 @@ Två krav som följer av det:
 Regelmotorn får sina appearances från iBIS plus roster_edits. Rådatan från iBIS
 skrivs aldrig över – ändringarna ligger som ett separat lager ovanpå.
 
+### 6.6 Live-uppdatering av resultatet
+
+Hemmalaget rapporterar mål löpande i iBIS under matchen, så resultatet finns i
+realtid. Appen hämtar det utan att någon trycker Uppdatera.
+
+**Backend.** En egen endpoint hämtar de pågående matchernas matchobjekt och
+lineups – inte hela synken. Pågående = kickoff har passerat, matchen är inte
+färdigrapporterad (`FinalResultCreatedTS` saknas) och det är högst cirka fyra
+timmar sedan kickoff. Är ingen match pågående svaras tomt utan att iBIS anropas
+alls. Svaret cachas cirka 30 sekunder på servern, så att flera klienter som
+pollar samtidigt bara ger ett anrop mot iBIS. Endpointen tål att iBIS är nere
+eller svarar långsamt utan att klienten hänger (kort timeout, inga omförsök, och
+senaste kända svar serveras om ett nytt inte går att hämta). Endpointen skriver
+inget till databasen och rör aldrig regelmotorns cache.
+
+**Frontend.** Pollas var 60:e sekund, överallt i appen, oavsett vy.
+Fire-and-forget precis som skottsynken: den läser aldrig den lokala lagringen och
+får aldrig blockera eller störa skottregistreringen. När målen kommer in
+uppdateras resultatraden och lagens skottotaler i matchvyn automatiskt, utan att
+vald period eller pågående registrering påverkas. Spelbarhets- och
+statistikvyn uppdateras fortfarande bara via Uppdatera-knappen och nattjobbet.
+
+**Statusindikator.** En liten, lågmäld ruta i hörnet, synlig i hela appen. Ingen
+uppkoppling visar "Offline", serverfel eller felkod visar "Error", och när allt
+fungerar visas ingen ruta alls.
+
 ---
 
 ## 7. Del 3 – Statistik
@@ -338,9 +396,11 @@ Per spelare, för valt lag och vald omfattning.
 
 De fyra andelarna summerar till 100 %.
 
-**Urval.** Överst väljer man lag och omfattning: senaste matchen, de senaste N
-matcherna, eller hela säsongen. N ska gå att sätta enkelt, utan att skriva in
-siffror i ett fält.
+**Urval.** Överst sitter lagväljaren A/B – samma väljare som i matchlistan, och
+en av de två vyer där den visas – och omfattningsvalet: senaste matchen, de
+senaste N matcherna, eller hela säsongen. N ska gå att sätta enkelt, utan att
+skriva in siffror i ett fält. Finns inga spelade matcher i omfattningen visas
+en förklarande rad, inte en tom eller trasig vy.
 
 **Lagseparation.** En spelare som spelat i båda lagen får statistiken uppdelad per
 lag. Varje match hör redan till lag A eller B, så en spelares siffror hör till
@@ -348,6 +408,9 @@ matchens lag. A-tränaren ser hans A-siffror, B-tränaren hans B-siffror.
 
 **Saknad data.** Skott finns bara för matcher där någon registrerat. Visa tomt
 eller en markering, inte noll – noll skott och ingen registrering är olika saker.
+En match där bara motståndarens skott registrerats räknas inte som registrerad
+här: statistiksidan är per spelare för det egna laget och tittar bara på rader
+med `side = 'egen'`. Motståndarens skott visas inte på statistiksidan.
 
 ---
 
@@ -377,7 +440,7 @@ Mobilen är den primära enheten genomgående. Bygg mobile-first.
 
 ## 10. Utanför scope
 
-- Motståndarnas skott
+- Motståndarnas skott **per spelare** (registreras bara på lagnivå, se 6.2)
 - Förvarning baserad på publicerade men ospelade trupper
 - C-laget, dam- och juniorlag
 - Cup- och träningsmatcher

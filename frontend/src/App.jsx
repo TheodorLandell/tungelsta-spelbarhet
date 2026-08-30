@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import PlayerGroup from './components/PlayerGroup'
 import MatchesTab from './components/Matches'
 import StatsTab from './components/Stats'
@@ -29,7 +29,7 @@ function loadTeam() {
 
 function TeamSwitcher({ team, onChange }) {
   return (
-    <div className="inline-flex rounded-xl border border-gray-300 bg-gray-100 p-1">
+    <div className="inline-flex rounded-xl bg-gray-100 p-0.5">
       {TEAMS.map(t => (
         <button
           key={t}
@@ -37,8 +37,8 @@ function TeamSwitcher({ team, onChange }) {
           aria-pressed={team === t}
           className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors ${
             team === t
-              ? 'bg-white text-gray-900 shadow-sm'
-              : 'text-gray-500 hover:text-gray-700'
+              ? 'bg-tuif-orange text-black'
+              : 'text-gray-500 hover:bg-gray-200'
           }`}
         >
           Lag {t}
@@ -64,8 +64,8 @@ function ViewNav({ view, onChange }) {
           aria-current={view === v.id ? 'page' : undefined}
           className={`px-4 py-2 text-sm font-semibold -mb-px border-b-2 transition-colors ${
             view === v.id
-              ? 'border-blue-600 text-blue-700'
-              : 'border-transparent text-gray-500 hover:text-gray-700'
+              ? 'border-tuif-orange text-black'
+              : 'border-transparent text-gray-500 hover:text-gray-800'
           }`}
         >
           {v.label}
@@ -80,6 +80,30 @@ function Counter({ label, count, colorClass }) {
     <div className={`rounded-xl p-3 text-center ${colorClass}`}>
       <div className="text-3xl font-bold tabular-nums">{count}</div>
       <div className="text-xs mt-1 leading-tight">{label}</div>
+    </div>
+  )
+}
+
+// Diskret statusruta i hörnet (SPEC 6.6). Ingen uppkoppling → "Offline",
+// serverfel eller felkod → "Error", allt fungerar → ingen ruta alls.
+function LiveStatusBadge({ status }) {
+  if (status === 'ok') return null
+  const offline = status === 'offline'
+  return (
+    <div
+      className={`fixed bottom-2 left-2 z-50 flex items-center gap-1.5 rounded-lg
+                  border px-2 py-1 text-[11px] font-medium shadow-sm ${
+                    offline
+                      ? 'bg-gray-100 border-gray-300 text-gray-600'
+                      : 'bg-red-50 border-red-200 text-red-700'
+                  }`}
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          offline ? 'bg-gray-400' : 'bg-red-500'
+        }`}
+      />
+      {offline ? 'Offline' : 'Error'}
     </div>
   )
 }
@@ -99,12 +123,14 @@ function LoginForm({ onLogin }) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 px-4">
+    <div className="min-h-screen flex items-center justify-center bg-white px-4">
       <div className="w-full max-w-sm">
-        <h1 className="text-2xl font-bold text-gray-900 mb-1 text-center">
-          Tungelsta IF
-        </h1>
-        <p className="text-sm text-gray-500 mb-6 text-center">Spelbarhetskoll</p>
+        <div className="bg-tuif-orange rounded-xl px-4 py-5 mb-6 text-center">
+          <h1 className="font-header text-5xl uppercase tracking-wide text-black leading-none">
+            Tungelsta IF
+          </h1>
+          <p className="text-sm text-black/70 mt-1">Spelbarhetskoll</p>
+        </div>
         <form onSubmit={submit} className="space-y-4">
           <div>
             <label
@@ -120,8 +146,8 @@ function LoginForm({ onLogin }) {
               onChange={e => setPwd(e.target.value)}
               autoFocus
               autoComplete="current-password"
-              className="w-full rounded-xl border border-gray-300 px-4 py-3 text-base
-                         focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full rounded-xl border-2 border-gray-300 px-4 py-3 text-base
+                         focus:outline-none focus:border-black focus:ring-2 focus:ring-black"
             />
           </div>
           {err && (
@@ -133,9 +159,9 @@ function LoginForm({ onLogin }) {
           <button
             type="submit"
             disabled={busy || !pwd}
-            className="w-full py-3 bg-blue-600 hover:bg-blue-700 active:bg-blue-800
-                       text-white rounded-xl text-sm font-semibold
-                       disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className="w-full py-3 bg-tuif-orange text-black rounded-xl
+                       text-sm font-semibold hover:brightness-95 active:brightness-90
+                       disabled:opacity-50 disabled:cursor-not-allowed transition"
           >
             {busy ? 'Loggar in...' : 'Logga in'}
           </button>
@@ -155,6 +181,19 @@ export default function App() {
   const [editMode, setEditMode] = useState(false)
   const [team, setTeam] = useState(loadTeam)
   const [view, setView] = useState('spelbarhet')
+  // true när man är inne i en enskild match – då göms meny och lagväljare,
+  // tillbaka-länken i matchvyn räcker. Sätts av MatchesTab.
+  const [insideMatch, setInsideMatch] = useState(false)
+  // Live-uppdatering av matchresultatet (SPEC 6.6). Pollas överallt i appen,
+  // fire-and-forget – rör aldrig skottregistreringen. liveStatus styr
+  // statusrutan i hörnet: 'ok' | 'offline' | 'error'.
+  const [live, setLive] = useState(null)
+  const [liveStatus, setLiveStatus] = useState('ok')
+
+  // Stabil referens – live-pollningen re-renderar App var 60:e sekund, och en
+  // ny arrow-funktion här skulle annars trigga omladdning i match- och
+  // statistikvyn vid varje puls.
+  const handleUnauthed = useCallback(() => setAuthed(false), [])
 
   function changeTeam(t) {
     setTeam(t)
@@ -168,7 +207,8 @@ export default function App() {
   async function fetchStatus() {
     setLoading(true)
     try {
-      const res = await fetch(`/api/status?team=${team}`)
+      // Spelbarhetsvyn är en samlad lista över alla spelare, oberoende av lag.
+      const res = await fetch('/api/status')
       if (res.status === 401) {
         setAuthed(false)
         return
@@ -243,7 +283,51 @@ export default function App() {
     }
   }
 
-  useEffect(() => { fetchStatus() }, [team])
+  useEffect(() => { fetchStatus() }, [])
+
+  // Bakgrundspollning av live-resultatet var 60:e sekund. Fristående från
+  // skottsynken: den läser aldrig IndexedDB och blockerar aldrig ett tryck.
+  // Uppdaterar bara resultatraden och lagens skottotaler i matchvyn –
+  // spelbarhets- och statistikvyn rörs inte.
+  useEffect(() => {
+    if (authed !== true) return undefined
+    let alive = true
+
+    async function poll() {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        if (alive) setLiveStatus('offline')
+        return
+      }
+      try {
+        const res = await fetch('/api/live')
+        if (!alive) return
+        if (res.status === 401) {
+          setAuthed(false)
+          return
+        }
+        if (!res.ok) {
+          setLiveStatus('error')
+          return
+        }
+        const data = await res.json()
+        if (!alive) return
+        setLive(data)
+        setLiveStatus('ok')
+      } catch {
+        if (alive) setLiveStatus('offline')
+      }
+    }
+
+    poll()
+    const iv = setInterval(poll, 60000)
+    const onOnline = () => poll()
+    window.addEventListener('online', onOnline)
+    return () => {
+      alive = false
+      clearInterval(iv)
+      window.removeEventListener('online', onOnline)
+    }
+  }, [authed])
 
   if (authed === null || (authed === true && loading && !data)) {
     return (
@@ -260,26 +344,54 @@ export default function App() {
   const r = data?.rakningar ?? {}
   const g = data?.grupper ?? {}
   const warnings = data?.varningar ?? []
+  const antalSpelare =
+    (r.maste_sta_over ?? 0) + (r.tillgangliga ?? 0) + (r.lasta ?? 0)
+
+  // Lagväljaren hör hemma i matchlistan och statistiken. Menyn göms när man är
+  // inne i en match – tillbaka-länken räcker där.
+  const visaLagvaljare =
+    (view === 'matcher' && !insideMatch) || view === 'statistik'
 
   return (
-    <div className="max-w-2xl mx-auto px-4 py-6 pb-16">
+    <div className="min-h-screen bg-white">
+      <LiveStatusBadge status={liveStatus} />
 
-      {/* Lagväljare – gäller hela appen */}
-      <div className="mb-3">
-        <TeamSwitcher team={team} onChange={changeTeam} />
-      </div>
+      {/* Klubbheader – tjockt orange band, klubbnamnet centrerat i svart, i en
+          kondenserad fetstilt sans (bara här, inte i brödtext). */}
+      <header className="bg-tuif-orange">
+        <div className="max-w-2xl mx-auto px-4 py-5 text-center">
+          <span className="font-header text-5xl sm:text-6xl uppercase tracking-wide text-black leading-none">
+            Tungelsta IF
+          </span>
+        </div>
+      </header>
 
-      {/* Navigering mellan vyerna */}
-      <div className="mb-5">
-        <ViewNav view={view} onChange={setView} />
-      </div>
+      <div className="max-w-2xl mx-auto px-4 py-6 pb-16">
+
+      {visaLagvaljare && (
+        <div className="mb-3">
+          <TeamSwitcher team={team} onChange={changeTeam} />
+        </div>
+      )}
+
+      {/* Navigering mellan vyerna – göms inne i en match */}
+      {!insideMatch && (
+        <div className="mb-5">
+          <ViewNav view={view} onChange={setView} />
+        </div>
+      )}
 
       {view === 'matcher' && (
-        <MatchesTab team={team} onUnauthed={() => setAuthed(false)} />
+        <MatchesTab
+          team={team}
+          live={live}
+          onUnauthed={handleUnauthed}
+          onInsideMatchChange={setInsideMatch}
+        />
       )}
 
       {view === 'statistik' && (
-        <StatsTab team={team} onUnauthed={() => setAuthed(false)} />
+        <StatsTab team={team} onUnauthed={handleUnauthed} />
       )}
 
       {view === 'spelbarhet' && (
@@ -288,7 +400,7 @@ export default function App() {
       <div className="mb-5 flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 leading-tight">
-            Tungelsta IF ({team})
+            Spelbarhet
           </h1>
           <p className="text-sm text-gray-500 mt-1">
             {data?.senaste_sync
@@ -298,10 +410,11 @@ export default function App() {
           <button
             onClick={handleSync}
             disabled={syncing}
-            className="mt-3 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 active:bg-blue-800
-                       text-white rounded-xl text-sm font-semibold
+            className="mt-3 px-5 py-2.5 bg-tuif-orange text-black
+                       hover:brightness-95 active:brightness-90
+                       rounded-xl text-sm font-semibold
                        disabled:opacity-50 disabled:cursor-not-allowed
-                       transition-colors"
+                       transition"
           >
             {syncing ? 'Uppdaterar...' : 'Uppdatera'}
           </button>
@@ -309,11 +422,12 @@ export default function App() {
 
         <button
           onClick={() => setEditMode(m => !m)}
+          aria-pressed={editMode}
           className={`shrink-0 mt-1 px-4 py-2.5 rounded-xl text-sm font-semibold
-                      transition-colors ${
+                      transition ${
             editMode
-              ? 'bg-green-600 hover:bg-green-700 text-white'
-              : 'bg-gray-100 hover:bg-gray-200 text-gray-700 border border-gray-300'
+              ? 'bg-black text-white'
+              : 'bg-tuif-orange text-black hover:brightness-95 active:brightness-90'
           }`}
         >
           {editMode ? 'Klar' : 'Redigera'}
@@ -367,39 +481,54 @@ export default function App() {
         </div>
       )}
 
+      {/* Tom lista innan säsongen har börjat – förklara varför, se inte trasig ut.
+          Bara när servern faktiskt svarat (data satt) och det inte är ett fel. */}
+      {data && !error && antalSpelare === 0 && (
+        <div className="border border-gray-200 bg-white rounded-xl px-4 py-8 text-center">
+          <p className="text-sm text-gray-500">
+            {data.senaste_sync
+              ? 'Ingen spelare har stått i truppen i en spelad seriematch än. Listan fylls när säsongen har börjat.'
+              : 'Ingen synk har gjorts än. Tryck Uppdatera för att hämta lag och matcher från iBIS.'}
+          </p>
+        </div>
+      )}
+
       {/* Player groups */}
-      <div className="space-y-8">
-        {(g.maste_sta_over ?? []).length > 0 && (
+      {antalSpelare > 0 && (
+        <div className="space-y-8">
+          {(g.maste_sta_over ?? []).length > 0 && (
+            <PlayerGroup
+              title="Måste stå över nästa A-match"
+              players={g.maste_sta_over}
+              variant="must-sit"
+              editMode={editMode}
+              onOverride={handleOverride}
+              onReset={handleReset}
+            />
+          )}
           <PlayerGroup
-            title="Måste stå över nästa A-match"
-            players={g.maste_sta_over}
-            variant="must-sit"
+            title="Tillgängliga"
+            players={g.tillgangliga ?? []}
+            variant="available"
             editMode={editMode}
             onOverride={handleOverride}
             onReset={handleReset}
           />
-        )}
-        <PlayerGroup
-          title="Tillgängliga"
-          players={g.tillgangliga ?? []}
-          variant="available"
-          editMode={editMode}
-          onOverride={handleOverride}
-          onReset={handleReset}
-        />
-        {(g.lasta ?? []).length > 0 && (
-          <PlayerGroup
-            title="Låsta i A-laget"
-            players={g.lasta}
-            variant="locked"
-            editMode={editMode}
-            onOverride={handleOverride}
-            onReset={handleReset}
-          />
-        )}
-      </div>
+          {(g.lasta ?? []).length > 0 && (
+            <PlayerGroup
+              title="Låsta i A-laget"
+              players={g.lasta}
+              variant="locked"
+              editMode={editMode}
+              onOverride={handleOverride}
+              onReset={handleReset}
+            />
+          )}
+        </div>
+      )}
        </>
       )}
+      </div>
     </div>
   )
 }

@@ -33,7 +33,7 @@ function PlayerLabel({ player }) {
       <span className="truncate text-sm text-gray-900">{player.namn}</span>
       {player.malvakt && (
         <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide
-                         text-indigo-700 bg-indigo-100 rounded px-1 py-0.5">
+                         text-white bg-black rounded px-1 py-0.5">
           MV
         </span>
       )}
@@ -60,15 +60,15 @@ function NoteConfirm({ label, busy, onConfirm, onCancel }) {
           if (e.key === 'Enter' && trimmed && !busy) onConfirm(trimmed)
         }}
         placeholder="Anteckning (krävs)"
-        className="w-full text-xs border border-gray-300 rounded-lg px-2.5 py-1.5
-                   focus:outline-none focus:ring-2 focus:ring-blue-500"
+        className="w-full text-xs border-2 border-gray-300 rounded-lg px-2.5 py-1.5
+                   focus:outline-none focus:border-black focus:ring-2 focus:ring-black"
       />
       <div className="flex gap-2">
         <button
           onClick={() => trimmed && onConfirm(trimmed)}
           disabled={busy || !trimmed}
-          className="text-xs px-3 py-1.5 bg-blue-600 text-white rounded-lg
-                     disabled:opacity-50 hover:bg-blue-700 transition-colors"
+          className="text-xs px-3 py-1.5 bg-tuif-orange text-black rounded-lg
+                     disabled:opacity-50 hover:brightness-95 active:brightness-90 transition"
         >
           {busy ? 'Sparar...' : label}
         </button>
@@ -151,9 +151,9 @@ export default function RosterEditor({ match, onChanged, onUnauthed }) {
       <div className="mt-6">
         <button
           onClick={() => setOpen(true)}
-          className="w-full py-3 rounded-xl border border-gray-300 bg-white
-                     text-sm font-semibold text-gray-700 hover:bg-gray-50
-                     transition-colors"
+          className="w-full py-3 rounded-xl bg-tuif-orange
+                     text-sm font-semibold text-black hover:brightness-95
+                     active:brightness-90 transition"
         >
           Ändra matchlista
         </button>
@@ -177,7 +177,8 @@ export default function RosterEditor({ match, onChanged, onUnauthed }) {
             setPending(null)
             setError(null)
           }}
-          className="text-xs text-blue-700 hover:text-blue-800 font-medium"
+          className="text-xs font-medium text-black underline underline-offset-2
+                     hover:text-gray-700"
         >
           Klar
         </button>
@@ -316,9 +317,9 @@ export default function RosterEditor({ match, onChanged, onUnauthed }) {
                         onClick={() =>
                           setPending({ playerId: p.player_id, action: 'add' })
                         }
-                        className="shrink-0 text-xs px-2.5 py-1 bg-blue-50 border
-                                   border-blue-200 text-blue-700 rounded-lg
-                                   hover:bg-blue-100 transition-colors"
+                        className="shrink-0 text-xs px-2.5 py-1 bg-tuif-orange
+                                   text-black rounded-lg
+                                   hover:brightness-95 active:brightness-90 transition"
                       >
                         Lägg till
                       </button>

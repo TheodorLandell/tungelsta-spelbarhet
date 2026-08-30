@@ -12,9 +12,9 @@ const OMF_KEY = 'stats_omfattning'
 
 const SEGMENT_FARG = {
   mal: 'bg-emerald-500',
-  pa_mal: 'bg-blue-500',
+  pa_mal: 'bg-black',
   utanfor: 'bg-amber-500',
-  i_tack: 'bg-slate-400',
+  i_tack: 'bg-gray-400',
 }
 
 function loadOmfattning() {
@@ -39,11 +39,11 @@ function OmfattningVal({ valt, onChange }) {
           key={o.id}
           onClick={() => onChange(o.id)}
           aria-pressed={valt === o.id}
-          className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors
-                      select-none touch-manipulation ${
+          className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition
+                      select-none touch-manipulation border ${
                         valt === o.id
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200 border border-gray-300'
+                          ? 'bg-tuif-orange text-black border-transparent'
+                          : 'bg-white text-gray-500 border-gray-200 hover:bg-gray-50'
                       }`}
         >
           {o.label}
@@ -143,7 +143,7 @@ function SpelarKort({ spelare }) {
           {spelare.malvakt && (
             <span
               className="ml-2 text-[10px] font-bold uppercase tracking-wide
-                         text-indigo-700 bg-indigo-100 rounded px-1.5 py-0.5 align-middle"
+                         text-white bg-black rounded px-1.5 py-0.5 align-middle"
             >
               MV
             </span>

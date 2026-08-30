@@ -123,7 +123,10 @@ class TestDeleteOverride:
         assert res.status_code == 200
 
     def test_override_borta_efter_aterstall(self, client, db):
+        # Spelaren har en spelad B-match, så han finns i listan även utan override.
+        add_match(db, 1, "B", datetime(2020, 1, 1))
         add_player(db, 42, "Kalle")
+        add_appearance(db, 1, 42, "Kalle")
         db.flush()
         client.post("/api/overrides", json={"player_id": 42, "kind": "set_matches_left", "value": 0, "note": "test"})
         client.delete("/api/overrides/42")
@@ -132,7 +135,7 @@ class TestDeleteOverride:
         player = next((p for p in res.json()["grupper"]["tillgangliga"] if p["player_id"] == 42), None)
         assert player is not None
         assert player["override"] is None
-        # Default matcher_kvar för ny spelare utan matcher
+        # Tillbaka till motorns värde: bara en B-match → 2 A-matcher kvar
         assert player["matcher_kvar"] == 2
 
 

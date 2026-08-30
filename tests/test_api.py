@@ -4,7 +4,7 @@ Databasen är en in-memory SQLite-instans per test.
 Synken är mockad – inga nätverksanrop.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,10 +13,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.api import app, get_db, _clear_status_cache
+from app.api import app, get_db, _clear_status_cache, _clear_live_cache
 from app.auth import require_session
+from app.ibis_client import IBISClient, IBISLineups
 from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
-from app.sync import SyncResult
+from app.sync import SyncResult, _now_naive
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +27,10 @@ from app.sync import SyncResult
 @pytest.fixture(autouse=True)
 def clear_cache():
     _clear_status_cache()
+    _clear_live_cache()
     yield
     _clear_status_cache()
+    _clear_live_cache()
 
 
 @pytest.fixture
@@ -65,19 +68,26 @@ def add_match(db, match_id, team, kickoff, status="played"):
 def add_match_raw(db, match_id, team, kickoff, status="scheduled", *,
                   home_team_id=1977, away_team_id=9999, venue="Tungelstahallen",
                   goals_home=None, goals_away=None, round_name="Omgång 1",
-                  opponent="Motståndarna", counts_for_rules=True, competition_type=1):
+                  opponent="Motståndarna", counts_for_rules=True, competition_type=1,
+                  home_team=None, away_team=None, final_result_ts=None):
+    raw = {
+        "HomeTeamID": home_team_id,
+        "AwayTeamID": away_team_id,
+        "MainVenue": venue,
+        "GoalsHomeTeam": goals_home,
+        "GoalsAwayTeam": goals_away,
+        "CompetitionTypeID": competition_type,
+        "FinalResultCreatedTS": final_result_ts,
+    }
+    if home_team is not None:
+        raw["HomeTeam"] = home_team
+    if away_team is not None:
+        raw["AwayTeam"] = away_team
     db.add(Match(
         match_id=match_id, team=team, competition_id=100,
         kickoff=kickoff, status=status, round_name=round_name, opponent=opponent,
         counts_for_rules=counts_for_rules,
-        raw={
-            "HomeTeamID": home_team_id,
-            "AwayTeamID": away_team_id,
-            "MainVenue": venue,
-            "GoalsHomeTeam": goals_home,
-            "GoalsAwayTeam": goals_away,
-            "CompetitionTypeID": competition_type,
-        },
+        raw=raw,
     ))
 
 
@@ -128,23 +138,16 @@ class TestGetStatus:
         assert data["senaste_sync"] is None
         assert data["rakningar"] == {"maste_sta_over": 0, "tillgangliga": 0, "lasta": 0}
 
-    def test_trupp_spelare_utan_matcher_ar_tillganglig_med_markering(self, db, api_client):
+    def test_trupp_spelare_utan_spelad_match_tas_inte_med(self, db, api_client):
+        # Bara registrerad i truppen, har inte stått i en spelad match. Visas
+        # inte i spelbarhetslistan (SPEC 5).
         add_player(db, 99, "Ny Spelare", "3")
         db.flush()
 
-        response = api_client.get("/api/status")
-        data = response.json()
+        data = api_client.get("/api/status").json()
 
-        tillg = data["grupper"]["tillgangliga"]
-        assert len(tillg) == 1
-        row = tillg[0]
-        assert row["player_id"] == 99
-        assert row["namn"] == "Ny Spelare"
-        assert row["trojnummer"] == "3"
-        assert row["maste_spela_b_forst"] is True
-        assert row["matcher_kvar"] == 2
-        assert row["lock_orsak"] is None
-        assert data["rakningar"]["tillgangliga"] == 1
+        assert data["grupper"]["tillgangliga"] == []
+        assert data["rakningar"]["tillgangliga"] == 0
 
     def test_spelare_med_b_match_ar_tillganglig(self, db, api_client):
         add_match(db, 1, "B", datetime(2020, 1, 1))
@@ -215,7 +218,7 @@ class TestGetStatus:
         add_player(db, 30, "Låst", "3")
         add_appearance(db, 2, 30, "Låst")
 
-        # Trupp utan matcher: spelare 40
+        # Trupp utan spelad match: spelare 40 – tas inte med (SPEC 5)
         add_player(db, 40, "NyTrupp", "4")
 
         db.flush()
@@ -224,7 +227,7 @@ class TestGetStatus:
         data = response.json()
 
         assert data["rakningar"]["maste_sta_over"] == 1
-        assert data["rakningar"]["tillgangliga"] == 2   # Tillgänglig + NyTrupp
+        assert data["rakningar"]["tillgangliga"] == 1   # bara Tillgänglig, inte NyTrupp
         assert data["rakningar"]["lasta"] == 1
 
     def test_tillgangliga_sorteras_med_lagst_matcher_kvar_forst(self, db, api_client):
@@ -321,10 +324,14 @@ class TestGetStatus:
 
 class TestTeamFilter:
     def _seed(self, db):
-        # Tre truppspelare utan matcher → alla i tillgangliga
+        # Tre spelare som alla stått i truppen i en spelad B-match → alla i
+        # tillgangliga. Lagfiltret styrs av player_teams, inte av var de spelat.
+        add_match(db, 90, "B", datetime(2020, 1, 1))
         add_player(db, 1, "A-spelare")
         add_player(db, 2, "B-spelare")
         add_player(db, 3, "Pendlare")
+        for pid in (1, 2, 3):
+            add_appearance(db, 90, pid)
         add_player_team(db, 1, "A")
         add_player_team(db, 2, "B")
         add_player_team(db, 3, "A")
@@ -409,8 +416,10 @@ class TestPostSync:
         before = api_client.get("/api/status").json()
         assert before["rakningar"]["tillgangliga"] == 0
 
-        # Lägg till en spelare i DB, kör sync → cache byggs om
+        # Lägg till en spelare med en spelad match i DB, kör sync → cache byggs om
+        add_match(db, 1, "B", datetime(2020, 1, 1))
         add_player(db, 99, "Ny", "1")
+        add_appearance(db, 1, 99, "Ny")
         db.flush()
         api_client.post("/api/sync")
 
@@ -579,17 +588,42 @@ class TestGetMatch:
         assert row["assist"] == 1
         assert row["utvisningsminuter"] == 2
 
+    def test_lagmal_till_matchhuvudet_bortalag(self, db, api_client):
+        # Lag B är borta (home_team_id != team_b_id). Våra mål = borta-målen.
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="played",
+                      home_team_id=9999, away_team_id=17541,
+                      goals_home=2, goals_away=5,
+                      home_team="Värdlaget IBK", away_team="Tungelsta IF (B)")
+        db.flush()
+
+        data = api_client.get("/api/matches/1").json()
+        assert data["hemma"] is False
+        assert data["mal"] == 5
+        assert data["motstandare_mal"] == 2
+        assert data["hemmalag"] == "Värdlaget IBK"
+        assert data["bortalag"] == "Tungelsta IF (B)"
+
+    def test_lagmal_saknas_tills_matchen_spelats(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 1, 13), status="scheduled",
+                      home_team_id=17541, away_team_id=9999)
+        db.flush()
+
+        data = api_client.get("/api/matches/1").json()
+        assert data["mal"] is None
+        assert data["motstandare_mal"] is None
+
 
 # ---------------------------------------------------------------------------
 # Skottsynk – GET/POST /api/matches/{id}/shot-events  (steg 14)
 # ---------------------------------------------------------------------------
 
-def shot_event(id, *, player_id=10, kind="on_goal", period=1,
+def shot_event(id, *, player_id=10, side="egen", kind="on_goal", period=1,
                created_at="2026-09-01T18:05:00.000Z", created_by="Theo",
                deleted_at=None):
     return {
-        "id": id, "player_id": player_id, "kind": kind, "period": period,
-        "created_at": created_at, "created_by": created_by, "deleted_at": deleted_at,
+        "id": id, "player_id": player_id, "side": side, "kind": kind,
+        "period": period, "created_at": created_at, "created_by": created_by,
+        "deleted_at": deleted_at,
     }
 
 
@@ -664,3 +698,208 @@ class TestShotEvents:
         res = api_client.post("/api/matches/1/shot-events", json={"handelser": []})
         assert res.status_code == 200
         assert res.json()["antal"] == 0
+
+    def test_egna_skott_defaultar_till_side_egen(self, db, api_client):
+        self._match(db)
+        api_client.post("/api/matches/1/shot-events", json={"handelser": [
+            shot_event("55555555-5555-4555-8555-555555555555"),
+        ]})
+        h = api_client.get("/api/matches/1/shot-events").json()["handelser"][0]
+        assert h["side"] == "egen"
+        assert h["player_id"] == 10
+
+    def test_motstandarens_skott_sparas_utan_spelare(self, db, api_client):
+        self._match(db)
+        res = api_client.post("/api/matches/1/shot-events", json={"handelser": [
+            shot_event("66666666-6666-4666-8666-666666666666",
+                       side="motstandare", player_id=None, kind="blocked"),
+        ]})
+        assert res.status_code == 200
+
+        h = api_client.get("/api/matches/1/shot-events").json()["handelser"][0]
+        assert h["side"] == "motstandare"
+        assert h["player_id"] is None
+        assert h["kind"] == "blocked"
+
+    def test_motstandarskott_med_spelare_ignorerar_spelaren(self, db, api_client):
+        self._match(db)
+        api_client.post("/api/matches/1/shot-events", json={"handelser": [
+            shot_event("77777777-7777-4777-8777-777777777777",
+                       side="motstandare", player_id=10),
+        ]})
+        h = api_client.get("/api/matches/1/shot-events").json()["handelser"][0]
+        assert h["player_id"] is None
+
+    def test_eget_skott_utan_spelare_ger_422(self, db, api_client):
+        self._match(db)
+        res = api_client.post("/api/matches/1/shot-events", json={"handelser": [
+            shot_event("x", side="egen", player_id=None),
+        ]})
+        assert res.status_code == 422
+
+    def test_ogiltig_side_ger_422(self, db, api_client):
+        self._match(db)
+        res = api_client.post("/api/matches/1/shot-events", json={"handelser": [
+            shot_event("x", side="hemma"),
+        ]})
+        assert res.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# GET /api/live – live-uppdatering av matchresultatet (SPEC 6.6)
+# ---------------------------------------------------------------------------
+
+def _ibis_match_dict(match_id, *, home_team_id=1977, away_team_id=9999,
+                     kickoff_offset_hours=-1.0, goals_home=None, goals_away=None,
+                     final_result_ts=None, competition_type=1):
+    md = _now_naive() + timedelta(hours=kickoff_offset_hours)
+    return {
+        "MatchID": match_id,
+        "CompetitionID": 100,
+        "CompetitionTypeID": competition_type,
+        "HomeTeamID": home_team_id,
+        "HomeTeam": f"Hemmalag {home_team_id}",
+        "AwayTeamID": away_team_id,
+        "AwayTeam": f"Bortalag {away_team_id}",
+        "MatchDateTime": md.replace(microsecond=0).isoformat(),
+        "Cancelled": False,
+        "Postponed": False,
+        "Abandoned": False,
+        "GoalsHomeTeam": goals_home,
+        "GoalsAwayTeam": goals_away,
+        "FinalResultCreatedTS": final_result_ts,
+        "Round": 1,
+        "RoundName": "Omgång 1",
+        "MatchStatus": None,
+    }
+
+
+def _team_raw(*match_dicts):
+    return {
+        "TeamID": 1977,
+        "Name": "Testlag",
+        "Competitions": [
+            {"CompetitionID": 100, "CompetitionTypeID": 1, "Name": "Serien",
+             "Matches": list(match_dicts)},
+        ],
+        "Players": [],
+    }
+
+
+def _lineups(match_id, away_players, *, home_id=1977, away_id=17541):
+    return IBISLineups.model_validate({
+        "MatchID": match_id,
+        "HomeTeamID": home_id,
+        "AwayTeamID": away_id,
+        "HomeTeamPlayers": [],
+        "AwayTeamPlayers": away_players,
+        "HomeTeamTeamPersons": [],
+        "AwayTeamTeamPersons": [],
+    })
+
+
+def _fake_client(team_raw, lineups_by_id=None):
+    client = MagicMock(spec=IBISClient)
+    client.fetch_team_raw.return_value = team_raw
+    client.fetch_lineups.side_effect = lambda mid: (lineups_by_id or {})[mid]
+    return client
+
+
+class TestGetLive:
+    def test_ingen_pagaende_match_ger_tomt_utan_ibis(self, db, api_client, monkeypatch):
+        # En match långt fram i tiden – inte pågående.
+        add_match_raw(db, 1, "B", _now_naive() + timedelta(days=3))
+        db.flush()
+
+        def boom(*a, **kw):
+            raise AssertionError("iBIS ska inte anropas när ingen match pågår")
+
+        monkeypatch.setattr("app.api.IBISClient", boom)
+
+        res = api_client.get("/api/live")
+        assert res.status_code == 200
+        assert res.json()["matcher"] == []
+
+    def test_fardigrapporterad_match_raknas_inte_som_pagaende(self, db, api_client, monkeypatch):
+        add_match_raw(db, 1, "B", _now_naive() - timedelta(hours=1),
+                      status="played", final_result_ts="2026-09-01T15:00:00")
+        db.flush()
+        monkeypatch.setattr("app.api.IBISClient",
+                            lambda *a, **kw: (_ for _ in ()).throw(AssertionError()))
+
+        assert api_client.get("/api/live").json()["matcher"] == []
+
+    def test_gammal_match_utanfor_fyratimmarsfonstret_ignoreras(self, db, api_client, monkeypatch):
+        add_match_raw(db, 1, "B", _now_naive() - timedelta(hours=5))
+        db.flush()
+        monkeypatch.setattr("app.api.IBISClient",
+                            lambda *a, **kw: (_ for _ in ()).throw(AssertionError()))
+
+        assert api_client.get("/api/live").json()["matcher"] == []
+
+    def test_pagaende_match_ger_resultat_och_spelarstatistik(self, db, api_client, monkeypatch):
+        # Lag B spelar borta (AwayTeamID == 17541), hemmalaget leder 2-1.
+        add_match_raw(db, 500, "B", _now_naive() - timedelta(hours=1),
+                      home_team_id=9999, away_team_id=17541)
+        db.flush()
+
+        team_raw = _team_raw(_ibis_match_dict(
+            500, home_team_id=9999, away_team_id=17541,
+            goals_home=2, goals_away=1,
+        ))
+        lineups = {500: _lineups(500, [
+            {"MatchPlayerID": 1, "PlayerID": 10, "Name": "Spelare Tio",
+             "Goals": 1, "Assists": 0, "PenaltyMinutes": 2},
+        ], home_id=9999, away_id=17541)}
+        monkeypatch.setattr("app.api.IBISClient", lambda *a, **kw: _fake_client(team_raw, lineups))
+
+        data = api_client.get("/api/live").json()
+        assert len(data["matcher"]) == 1
+        row = data["matcher"][0]
+        assert row["match_id"] == 500
+        assert row["hemma"] is False
+        assert row["mal"] == 1            # våra (borta-)mål
+        assert row["motstandare_mal"] == 2
+        assert row["resultat"] == {"hemma": 2, "borta": 1}
+        assert row["status"] == "played"
+        assert row["spelare"] == [
+            {"player_id": 10, "mal": 1, "assist": 0, "utvisningsminuter": 2},
+        ]
+
+    def test_svaret_cachas_sa_flera_pollningar_ger_ett_ibis_anrop(self, db, api_client, monkeypatch):
+        # Lag B spelar borta, leder 3-0.
+        add_match_raw(db, 1, "B", _now_naive() - timedelta(hours=1),
+                      home_team_id=9999, away_team_id=17541)
+        db.flush()
+
+        team_raw = _team_raw(_ibis_match_dict(
+            1, home_team_id=9999, away_team_id=17541, goals_home=0, goals_away=3,
+        ))
+        lineups = {1: _lineups(1, [], home_id=9999, away_id=17541)}
+        calls = {"n": 0}
+
+        def factory(*a, **kw):
+            calls["n"] += 1
+            return _fake_client(team_raw, lineups)
+
+        monkeypatch.setattr("app.api.IBISClient", factory)
+
+        first = api_client.get("/api/live").json()
+        second = api_client.get("/api/live").json()
+        assert first == second
+        assert first["matcher"][0]["mal"] == 3
+        assert calls["n"] == 1
+
+    def test_ibis_nere_utan_cache_ger_felkod(self, db, api_client, monkeypatch):
+        add_match_raw(db, 1, "B", _now_naive() - timedelta(hours=1))
+        db.flush()
+
+        def factory(*a, **kw):
+            c = MagicMock(spec=IBISClient)
+            c.fetch_team_raw.side_effect = ConnectionError("iBIS nere")
+            return c
+
+        monkeypatch.setattr("app.api.IBISClient", factory)
+
+        res = api_client.get("/api/live")
+        assert res.status_code == 502

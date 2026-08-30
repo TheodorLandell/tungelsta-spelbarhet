@@ -105,6 +105,9 @@ def compute_stats(db: Session, team: str, scope: str, n: int = 5) -> dict:
         select(ShotEvent).where(
             ShotEvent.match_id.in_(scoped_set),
             ShotEvent.deleted_at.is_(None),
+            # Bara egna skott. Motståndarens skott (SPEC 6.1) hör inte till någon
+            # spelare och ska inte markera en match som registrerad här.
+            ShotEvent.side == "egen",
         )
     ).all():
         registered_matches.add(e.match_id)
