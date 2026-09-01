@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
 import PlayerGroup from './components/PlayerGroup'
+import PlayerSearch from './components/PlayerSearch'
 import MatchesTab from './components/Matches'
 import StatsTab from './components/Stats'
+import { matchesPlayerQuery } from './lib/search'
 
 function formatDateTime(isoStr) {
   if (!isoStr) return null
@@ -179,6 +181,7 @@ export default function App() {
   const [syncing, setSyncing] = useState(false)
   const [error, setError] = useState(null)
   const [editMode, setEditMode] = useState(false)
+  const [sok, setSok] = useState('')
   const [team, setTeam] = useState(loadTeam)
   const [view, setView] = useState('spelbarhet')
   // true när man är inne i en enskild match – då göms meny och lagväljare,
@@ -347,6 +350,17 @@ export default function App() {
   const antalSpelare =
     (r.maste_sta_over ?? 0) + (r.tillgangliga ?? 0) + (r.lasta ?? 0)
 
+  // Sökfältet filtrerar grupperingen men rör aldrig räknarna högst upp (SPEC 5).
+  const sokQuery = sok.trim()
+  const isSearching = sokQuery.length > 0
+  const filterPlayers = players =>
+    isSearching ? players.filter(p => matchesPlayerQuery(p, sokQuery)) : players
+  const mastStaOverList = filterPlayers(g.maste_sta_over ?? [])
+  const tillgangligaList = filterPlayers(g.tillgangliga ?? [])
+  const lastaList = filterPlayers(g.lasta ?? [])
+  const totalTraffar =
+    mastStaOverList.length + tillgangligaList.length + lastaList.length
+
   // Lagväljaren hör hemma i matchlistan och statistiken. Menyn göms när man är
   // inne i en match – tillbaka-länken räcker där.
   const visaLagvaljare =
@@ -493,38 +507,51 @@ export default function App() {
         </div>
       )}
 
+      {/* Sökfält – mellan räknarna och spelarlistan (SPEC 5) */}
+      {antalSpelare > 0 && (
+        <PlayerSearch value={sok} onChange={setSok} />
+      )}
+
       {/* Player groups */}
       {antalSpelare > 0 && (
-        <div className="space-y-8">
-          {(g.maste_sta_over ?? []).length > 0 && (
-            <PlayerGroup
-              title="Måste stå över nästa A-match"
-              players={g.maste_sta_over}
-              variant="must-sit"
-              editMode={editMode}
-              onOverride={handleOverride}
-              onReset={handleReset}
-            />
-          )}
-          <PlayerGroup
-            title="Tillgängliga"
-            players={g.tillgangliga ?? []}
-            variant="available"
-            editMode={editMode}
-            onOverride={handleOverride}
-            onReset={handleReset}
-          />
-          {(g.lasta ?? []).length > 0 && (
-            <PlayerGroup
-              title="Låsta i A-laget"
-              players={g.lasta}
-              variant="locked"
-              editMode={editMode}
-              onOverride={handleOverride}
-              onReset={handleReset}
-            />
-          )}
-        </div>
+        isSearching && totalTraffar === 0 ? (
+          <p className="text-sm text-gray-500 text-center py-8">
+            Ingen spelare matchar sökningen.
+          </p>
+        ) : (
+          <div className="space-y-8">
+            {mastStaOverList.length > 0 && (
+              <PlayerGroup
+                title="Måste stå över nästa A-match"
+                players={mastStaOverList}
+                variant="must-sit"
+                editMode={editMode}
+                onOverride={handleOverride}
+                onReset={handleReset}
+              />
+            )}
+            {(!isSearching || tillgangligaList.length > 0) && (
+              <PlayerGroup
+                title="Tillgängliga"
+                players={tillgangligaList}
+                variant="available"
+                editMode={editMode}
+                onOverride={handleOverride}
+                onReset={handleReset}
+              />
+            )}
+            {lastaList.length > 0 && (
+              <PlayerGroup
+                title="Låsta i A-laget"
+                players={lastaList}
+                variant="locked"
+                editMode={editMode}
+                onOverride={handleOverride}
+                onReset={handleReset}
+              />
+            )}
+          </div>
+        )
       )}
        </>
       )}

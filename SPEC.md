@@ -236,6 +236,15 @@ Redan byggd. Ändringar:
   även utan spelad match, eftersom det är en medveten åtgärd av tränaren.
 - Listan får vara tom innan säsongen har börjat. Då ska vyn säga varför (inga
   spelade matcher än, eller ingen synk gjord), inte se trasig ut.
+- Ett sökfält sitter mellan de tre räknarna och spelarlistan. Det filtrerar
+  medan man skriver, på både namn och tröjnummer, med delsträngsmatchning,
+  skiftlägesokänsligt och med korrekt hantering av å, ä och ö (t.ex. matchar
+  "ostberg" spelaren "Alexander Östberg"). Spelare utan tröjnummer hanteras
+  utan att krascha. Grupperingen (måste stå över / tillgängliga / låsta)
+  behålls vid sökning; en grupp utan träffar döljs helt, inklusive sin
+  rubrik. Vid noll träffar visas en kort rad i stället för en tom lista.
+  Fältet har en rensa-knapp som bara syns när något är inskrivet. Räknarna
+  högst upp visar alltid totalen och påverkas aldrig av sökningen.
 
 I övrigt oförändrad: grupperad lista (måste stå över / tillgängliga / låsta),
 skrivskyddad tills redigera-knappen aktiveras, overrides som appliceras efter
@@ -258,13 +267,20 @@ Per match: datum, tid, motståndare, hemma/borta, hall, resultat om spelat.
 Öppnas genom att klicka på en match. Visar matchens trupp och låter tränaren
 registrera skott per spelare, plus motståndarens skott på lagnivå.
 
-**Matchhuvud.** Ingen box och ingen ram. Överst en resultatrad i klassisk stil:
-hemmalag, mål, mål, bortalag på en rad, med lagnamn och siffror betydligt större
-än brödtexten. Direkt under respektive lagnamn en liten rad med lagets skott:
-skott totalt, på mål, utanför, i täck – bara antal, inga andelar, ingen stjärna.
-Lagstatistiken följer vald period precis som spelarnas, inklusive läget "Hela
-matchen". Totala skott = mål + på mål + utanför + i täck, som för spelarna. Före
-matchen är resultatet blankt – inga platshållarrutor med streck. När iBIS
+**Matchhuvud.** Ingen box och ingen ram. Fast trekolumnslayout:
+hemmalag | resultat | bortalag. Hemmalagets kolumn är högerställd mot mitten,
+bortalagets vänsterställd mot mitten, med lagnamn och siffror betydligt större
+än brödtexten. Mittkolumnen har en **fast bredd som aldrig ändras** – blankt,
+ensiffrigt eller tvåsiffrigt resultat tar exakt samma plats, så att lagnamnen
+aldrig hoppar när resultatet kommer in eller växer (t.ex. 9-9 → 10-9).
+Resultatsiffrorna är stora och centrerade i mittkolumnen, med ett tunt
+bindestreck mellan siffrorna. Lagnamn får radbrytas om de är långa utan att
+mittkolumnen flyttar sig. Direkt under respektive lagnamn, i samma kolumn som
+laget, en liten rad med lagets skott: skott totalt, på mål, utanför, i täck –
+bara antal, inga andelar, ingen stjärna. Lagstatistiken följer vald period
+precis som spelarnas, inklusive läget "Hela matchen". Totala skott = mål + på
+mål + utanför + i täck, som för spelarna. Före matchen är mittkolumnen tom men
+behåller exakt samma bredd – inga platshållarrutor med streck. När iBIS
 rapporterat visas siffrorna, även 0-0; live-uppdateringen (6.6) fyller dem under
 matchens gång. Datum, hall och "ej spelad än" hör hemma i matchlistan och visas
 inte i huvudet.
@@ -285,6 +301,14 @@ knappas aldrig in.
 **Kontroller.** Per spelare och kategori: en stor plusknapp som visar antalet, och
 en smalare minusknapp under. Plus är den vanliga handlingen och ska gå att träffa
 med tummen utan att titta. Minus finns tillgängligt men tar mindre plats.
+
+**Sökfält** mellan periodväljaren och motståndarens skottblock. Samma
+sökregler som i spelbarhetslistan (5): namn och tröjnummer, delsträng,
+skiftlägesokänsligt, hanterar å, ä och ö, rensa-knapp och en kort rad vid noll
+träffar. Filtrerar enbart spelarlistan – motståndarens skottblock ligger alltid
+kvar synligt och registrering fungerar som vanligt på de spelare som visas.
+Påverkar inte lagstatistiken i matchhuvudet. Söktexten nollställs inte när man
+byter period.
 
 **Motståndarens skott** registreras på lagnivå, inte per spelare. Blocket formges
 exakt som ett spelarkort – motståndarens namn där spelarnamnet står, sedan samma

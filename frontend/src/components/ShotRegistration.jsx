@@ -12,7 +12,9 @@ import {
   unsyncedCount,
 } from '../lib/shotStore'
 import { syncMatch, SyncError } from '../lib/shotSync'
+import { matchesPlayerQuery } from '../lib/search'
 import MatchHeader from './MatchHeader'
+import PlayerSearch from './PlayerSearch'
 
 const PERIODS = [1, 2, 3]
 const NAME_KEY = 'tranare_kortnamn'
@@ -263,6 +265,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
 
   const [events, setEvents] = useState(null)
   const [period, setPeriod] = useState(1)
+  const [sok, setSok] = useState('')
   const [name, setName] = useState(loadName)
   const [loadError, setLoadError] = useState(false)
   const [syncState, setSyncState] = useState('idle') // idle|syncing|synced|offline|error
@@ -495,6 +498,9 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
   const oppCounts = countSide(events, 'motstandare', period) // motståndaren, vald period
   const osynkade = unsyncedCount(events)
   const malById = new Map(trupp.map(p => [p.player_id, p.mal]))
+  const filteredTrupp = sok.trim()
+    ? trupp.filter(p => matchesPlayerQuery(p, sok))
+    : trupp
 
   return (
     <div>
@@ -576,6 +582,10 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
         )}
       </div>
 
+      {/* Sökfält – filtrerar bara spelarlistan, motståndarblocket ligger alltid
+          kvar synligt (SPEC 6.2) */}
+      <PlayerSearch value={sok} onChange={setSok} />
+
       {/* Motståndarens skott – bara på lagnivå (SPEC 6.1). Formgivet som ett
           spelarkort med lagnamnet där spelarnamnet står, och placerat ovanför
           spelarlistan. Samma tre kategorier, knappar, periodtaggning och synk. */}
@@ -615,19 +625,25 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
             Översikt · hela matchen · skrivskyddat
           </div>
         )}
-        {trupp.map(p => (
-          <PlayerCard
-            key={p.player_id}
-            player={p}
-            counts={counts}
-            totalCounts={totalCounts}
-            malFromIbis={malById.get(p.player_id)}
-            onPlus={handlePlus}
-            onMinus={handleMinus}
-            disabled={!name}
-            overview={overview}
-          />
-        ))}
+        {sok.trim() && filteredTrupp.length === 0 ? (
+          <p className="px-3 py-6 text-sm text-gray-500 text-center">
+            Ingen spelare matchar sökningen.
+          </p>
+        ) : (
+          filteredTrupp.map(p => (
+            <PlayerCard
+              key={p.player_id}
+              player={p}
+              counts={counts}
+              totalCounts={totalCounts}
+              malFromIbis={malById.get(p.player_id)}
+              onPlus={handlePlus}
+              onMinus={handleMinus}
+              disabled={!name}
+              overview={overview}
+            />
+          ))
+        )}
       </div>
     </div>
   )

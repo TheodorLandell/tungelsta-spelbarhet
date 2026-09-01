@@ -5,6 +5,12 @@
 //
 // Före matchen är resultatet blankt. När iBIS rapporterat visas siffrorna, även
 // 0-0. Lagstatistiken följer vald period precis som spelarnas.
+//
+// Trekolumnslayout: mittkolumnen har en fast bredd (MID_COL_WIDTH) som aldrig
+// ändras – blankt, 0-0 eller 10-9 tar exakt samma plats – så att hemma- och
+// bortalagets kolumner aldrig hoppar när resultatet kommer in.
+
+const MID_COL_WIDTH = 'w-24' // 6rem, rymmer tvåsiffriga resultat utan att växa
 
 const ZERO = { on_goal: 0, missed: 0, blocked: 0 }
 
@@ -51,21 +57,20 @@ export default function MatchHeader({ match, ownShots = ZERO, oppShots = ZERO })
         {!installd && <ShotLine mal={homeGoals} shots={homeShots} />}
       </div>
 
-      <div className="shrink-0 pt-0.5 text-center">
+      <div className={`shrink-0 ${MID_COL_WIDTH} pt-0.5 text-center`}>
         {installd ? (
-          <span className="text-sm font-semibold text-amber-700 bg-amber-100
-                           rounded-lg px-3 py-1">
+          <span className="inline-block max-w-full text-sm font-semibold
+                           text-amber-700 bg-amber-100 rounded-lg px-3 py-1">
             Inställd
           </span>
         ) : harResultat ? (
-          <div className="text-3xl font-extrabold tabular-nums text-gray-900
-                          whitespace-nowrap">
+          <div className="text-3xl font-extrabold tabular-nums text-gray-900">
             {homeGoals}
-            <span className="mx-2 text-gray-300">–</span>
+            <span className="mx-1.5 font-normal text-gray-300">–</span>
             {awayGoals}
           </div>
         ) : (
-          // Före matchen: blankt, inga platshållarrutor.
+          // Före matchen: blankt, men mittkolumnen behåller sin fasta bredd.
           <div className="h-9" aria-hidden="true" />
         )}
       </div>
