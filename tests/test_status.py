@@ -227,3 +227,63 @@ class TestTraningsmatcherRaknasInte:
 
         assert statuses == {}
         assert warnings == []
+
+
+class TestKommandeMatcherMedPublicieradTrupp:
+    """
+    Sync sparar nu appearances för matcher innan de är spelade, eftersom
+    truppen publiceras i iBIS i förväg (se app/sync.py). De appearanserna
+    ska synas (för matchvyn) men aldrig påverka kedjan eller låsstatusen –
+    bara matchens status ('played' vs 'scheduled') skyddar regelmotorn.
+    """
+
+    def test_kommande_a_matcher_paverkar_inte_kedja_eller_lasstatus(self, db):
+        # Spelaren står i truppen för tre kommande A-matcher i rad, utan
+        # någon B-match först. Vore de "played" skulle båda reglerna låsa
+        # honom direkt – som scheduled ska de inte räknas alls.
+        add_match(db, 1, "A", datetime(2026, 9, 10), status="scheduled")
+        add_match(db, 2, "A", datetime(2026, 9, 17), status="scheduled")
+        add_match(db, 3, "A", datetime(2026, 9, 24), status="scheduled")
+        for mid in (1, 2, 3):
+            add_appearance(db, mid, 42, "Kommande Spelare")
+        db.flush()
+
+        statuses, warnings = get_statuses(db)
+
+        # Matcherna är scheduled → ignoreras helt, spelaren finns inte i utfallet.
+        assert 42 not in statuses
+        assert warnings == []
+
+    def test_samma_matcher_som_spelade_laser_spelaren(self, db):
+        # Samma tre matcher, men nu markerade som spelade (t.ex. efter att
+        # iBIS rapporterat resultat) – då ska kvalificeringsregeln slå till.
+        add_match(db, 1, "A", datetime(2026, 9, 10), status="played")
+        add_match(db, 2, "A", datetime(2026, 9, 17), status="played")
+        add_match(db, 3, "A", datetime(2026, 9, 24), status="played")
+        for mid in (1, 2, 3):
+            add_appearance(db, mid, 42, "Kommande Spelare")
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        assert statuses[42].locked
+        assert statuses[42].lock_reason.value == "spelade A-match innan nagon B-match"
+
+    def test_kommande_match_syns_men_paverkar_inte_befintlig_kedja(self, db):
+        # B, A, A spelade (2 i rad, måste stå över) – sedan en tredje A-match
+        # som bara är schemalagd. Den kommande matchen ska synas i underlaget
+        # men inte utlösa "tre i rad" förrän den faktiskt är spelad.
+        add_match(db, 1, "B", datetime(2026, 8, 1), status="played")
+        add_match(db, 2, "A", datetime(2026, 8, 10), status="played")
+        add_match(db, 3, "A", datetime(2026, 8, 20), status="played")
+        add_match(db, 4, "A", datetime(2026, 9, 1), status="scheduled")
+        for mid in (1, 2, 3, 4):
+            add_appearance(db, mid, 42, "Spelare")
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        s = statuses[42]
+        assert not s.locked
+        assert s.matches_left == 0          # måste stå över, ej redan låst
+        assert s.a_match_ids == [2, 3]       # den schemalagda matchen räknas inte med

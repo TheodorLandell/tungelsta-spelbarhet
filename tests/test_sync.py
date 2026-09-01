@@ -255,9 +255,11 @@ class TestRunSync:
         assert apps[0].player_id == 42
         assert apps[0].shirt_no == "7"
 
-    def test_schemalagd_match_ger_inga_appearances(self, db, monkeypatch):
+    def test_schemalagd_match_utan_publicerad_trupp_ger_inga_appearances(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
 
+        # Lineups hämtas ändå (truppen kan vara publicerad i förväg), men
+        # mock-klienten ger en tom trupp om inget annat anges – då sparas inget.
         m = make_match_dict(1002, match_datetime="2099-01-01T19:00:00")
         client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
 
@@ -266,7 +268,51 @@ class TestRunSync:
         assert log.ok is True
         match = db.get(Match, 1002)
         assert match.status == "scheduled"
-        client.fetch_lineups.assert_not_called()
+        client.fetch_lineups.assert_called_once_with(1002)
+        assert db.scalars(select(Appearance).where(Appearance.match_id == 1002)).all() == []
+
+    def test_schemalagd_match_med_publicerad_trupp_ger_appearances(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Konkret fall ur buggrapporten: truppen är publicerad i iBIS långt
+        # innan matchen är spelad, och ska sparas så registreringsvyn kan visa den.
+        m = make_match_dict(1767137, match_datetime="2099-01-01T19:00:00")
+        lineups = make_lineups_dict(1767137, away_players=[make_player_dict(42, "Kalle", "7")])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={1767137: lineups},
+        )
+
+        log = run_sync(db, client)
+
+        assert log.ok is True
+        match = db.get(Match, 1767137)
+        assert match.status == "scheduled"
+        apps = db.scalars(select(Appearance).where(Appearance.match_id == 1767137)).all()
+        assert len(apps) == 1
+        assert apps[0].player_id == 42
+
+    def test_schemalagd_match_hamtar_om_trupp_varje_synk(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # En ännu inte färdigrapporterad match ska hämtas om varje synk, så
+        # en ändrad trupp speglas – oavsett om matchen redan är spelad eller ej.
+        m = make_match_dict(1009, match_datetime="2099-01-01T19:00:00")
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={1009: make_lineups_dict(1009, away_players=[make_player_dict(1)])},
+        )
+        run_sync(db, client)
+
+        client2 = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={1009: make_lineups_dict(1009, away_players=[make_player_dict(1), make_player_dict(2)])},
+        )
+        run_sync(db, client2)
+
+        client2.fetch_lineups.assert_called_once_with(1009)
+        apps = db.scalars(select(Appearance).where(Appearance.match_id == 1009)).all()
+        assert {a.player_id for a in apps} == {1, 2}
 
     def test_instaelld_match_sparas_som_cancelled(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
@@ -438,13 +484,14 @@ class TestRunSync:
             ],
         }
 
-    def test_cupmatch_sparas_men_raknas_inte(self, db, monkeypatch):
+    def test_cupmatch_far_lineups_men_raknas_inte(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
 
         team_dict = self._non_series_team_dict(
             3, [make_match_dict(9001, final_result_ts="2020-01-15T21:00:00")]
         )
-        client = build_client(team_a_dict=team_dict)
+        lineups = make_lineups_dict(9001, away_players=[make_player_dict(42, "Kalle", "7")])
+        client = build_client(team_a_dict=team_dict, lineups_by_id={9001: lineups})
 
         result = run_sync(db, client)
 
@@ -452,25 +499,54 @@ class TestRunSync:
         assert match is not None
         assert match.team == "A"
         assert match.counts_for_rules is False
-        # Inga lineups/appearances för matcher som inte räknas
-        client.fetch_lineups.assert_not_called()
-        assert db.scalars(select(Appearance).where(Appearance.match_id == 9001)).all() == []
+        # Lineups hämtas och appearances sparas – de påverkar ändå inte
+        # regelmotorn, som filtrerar bort matchen via counts_for_rules.
+        client.fetch_lineups.assert_called_once_with(9001)
+        apps = db.scalars(select(Appearance).where(Appearance.match_id == 9001)).all()
+        assert len(apps) == 1
+        assert apps[0].player_id == 42
         assert result.matches_added == 1
 
-    def test_traningsmatch_annan_competitiontype_sparas_utan_lineups(self, db, monkeypatch):
+    def test_traningsmatch_annan_competitiontype_far_publicerad_trupp(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
 
-        # Konkret fall ur uppgiften: CompetitionTypeID 3, framtida match
+        # Konkret fall ur buggrapporten: match 1767137, träningsmatch mot
+        # Hammarby, CompetitionTypeID 3, ej spelad än – men truppen är redan
+        # publicerad i iBIS och ska sparas så registreringsvyn kan visa den.
         m = make_match_dict(1767137, home_team_id=TEAM_A_ID, away_team_id=OTHER_ID,
                             match_datetime="2026-09-01T20:20:00")
-        client = build_client(team_a_dict=self._non_series_team_dict(3, [m]))
+        lineups = make_lineups_dict(1767137, home_id=TEAM_A_ID, away_id=OTHER_ID,
+                                    home_players=[make_player_dict(42, "Kalle", "7")])
+        client = build_client(
+            team_a_dict=self._non_series_team_dict(3, [m]),
+            lineups_by_id={1767137: lineups},
+        )
 
         run_sync(db, client)
 
         match = db.get(Match, 1767137)
         assert match is not None
         assert match.counts_for_rules is False
-        client.fetch_lineups.assert_not_called()
+        client.fetch_lineups.assert_called_once_with(1767137)
+        apps = db.scalars(select(Appearance).where(Appearance.match_id == 1767137)).all()
+        assert len(apps) == 1
+        assert apps[0].player_id == 42
+
+    def test_traningsmatch_utan_publicerad_trupp_sparar_inget(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Samma träningsmatch, men truppen är ännu inte publicerad i iBIS
+        # (tomma lineups) – då ska ingenting sparas.
+        m = make_match_dict(1767137, home_team_id=TEAM_A_ID, away_team_id=OTHER_ID,
+                            match_datetime="2026-09-01T20:20:00")
+        client = build_client(team_a_dict=self._non_series_team_dict(3, [m]))
+
+        run_sync(db, client)
+
+        client.fetch_lineups.assert_called_once_with(1767137)
+        assert db.scalars(
+            select(Appearance).where(Appearance.match_id == 1767137)
+        ).all() == []
 
     def test_seriematch_far_counts_for_rules_true(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)

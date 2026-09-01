@@ -247,10 +247,9 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
                     if is_new:
                         matches_added += 1
 
-                    # Cup och träningsmatcher: bara matchraden sparas. Inga
-                    # lineups, inga appearances, inga varningar – de påverkar
-                    # ändå inte regelmotorn.
-                    if not counts_for_rules:
+                    # Inställda matcher hoppas över helt (SPEC punkt 1) – de
+                    # spelas aldrig och får aldrig en publicerad trupp.
+                    if match.Cancelled:
                         continue
 
                     # Avbruten utan resultat: logga varning, hoppa över appearances
@@ -261,14 +260,17 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
                         )
                         continue
 
-                    if not is_played(match):
-                        continue
-
+                    # Truppen publiceras i iBIS före matchstart, så lineups
+                    # hämtas för alla matcher – spelade, kommande och cup/
+                    # träning – oavsett status eller CompetitionTypeID. Är
+                    # lineups tom sparas inget (players blir []). Det är
+                    # counts_for_rules (satt ovan) som avgör om matchen når
+                    # regelmotorn, se app/status.py – sync.py sparar bara
+                    # underlaget.
+                    #
                     # Färdigrapporterad match med sparade appearances hämtas
-                    # inte om (SPEC 3.5). En spelad men ännu inte
-                    # färdigrapporterad match hämtas om varje synk så att
-                    # Goals/Assists/PenaltyMinutes på befintliga appearances
-                    # hålls uppdaterade.
+                    # inte om (SPEC 3.5). Alla andra hämtas om varje synk så
+                    # att en ändrad trupp eller uppdaterad statistik speglas.
                     if (
                         not is_new
                         and match.FinalResultCreatedTS
