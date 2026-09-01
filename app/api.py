@@ -18,6 +18,7 @@ DELETE /api/matches/{id}/roster-edits/{pid}  – ångra en tidigare ändring
 GET  /{path}                  – serverar byggt frontend (SPA-fallback)
 """
 
+import logging
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -60,6 +61,8 @@ from app.sync import _match_status, _now_naive, run_sync
 
 _DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -83,6 +86,14 @@ LIVE_IBIS_TIMEOUT = 6.0
 _live_lock = threading.Lock()
 _live_state: dict[str, Any] = {"ts": None, "payload": None, "refreshing": False}
 
+# POST /api/sync startar synken i en bakgrundstråd och svarar direkt (SPEC
+# 3.5): lineups hämtas sekventiellt med paus och kan ta minuter, så ett
+# synkront anrop skulle hinna timeouta. _sync_state["running"] hindrar att två
+# synkar körs samtidigt – startar någon en synk medan en redan pågår svarar
+# endpointen att en redan är igång.
+_sync_state_lock = threading.Lock()
+_sync_state: dict[str, bool] = {"running": False}
+
 _COOKIE_MAX_AGE = 30 * 24 * 3600
 
 
@@ -105,6 +116,35 @@ def _clear_live_cache() -> None:
         _live_state["ts"] = None
         _live_state["payload"] = None
         _live_state["refreshing"] = False
+
+
+def _sync_worker() -> None:
+    """Kör synken och bygger om statuscachen. Körs i en bakgrundstråd så att
+    POST /api/sync kan svara direkt utan att hålla HTTP-anropet öppet."""
+    global _status_cache
+    try:
+        client = IBISClient()
+        with SessionLocal() as db:
+            run_sync(db, client)
+            new_status = _build_status_response(db)
+        with _cache_lock:
+            _status_cache = new_status
+    except Exception:
+        log.exception("Bakgrundssynken avbröts med ett oväntat fel")
+    finally:
+        with _sync_state_lock:
+            _sync_state["running"] = False
+
+
+def _start_background_sync() -> bool:
+    """Startar en bakgrundssynk om ingen redan pågår. Returnerar True om en ny
+    synk startades, False om en redan var igång."""
+    with _sync_state_lock:
+        if _sync_state["running"]:
+            return False
+        _sync_state["running"] = True
+    threading.Thread(target=_sync_worker, name="sync-worker", daemon=True).start()
+    return True
 
 
 def _last_sync_ts(db: Session) -> str | None:
@@ -382,25 +422,39 @@ def get_status(
 
 
 @app.post("/api/sync")
-def post_sync(
+def post_sync(_: None = Depends(require_session)) -> dict:
+    """
+    Startar synken i bakgrunden och svarar direkt, så anropet aldrig hinner
+    timeouta medan lineups hämtas sekventiellt (SPEC 3.5). Pågår redan en synk
+    startas ingen ny – svaret säger då att en redan är igång.
+    """
+    startad = _start_background_sync()
+    return {"startad": startad, "pagar": True}
+
+
+@app.get("/api/sync/status")
+def get_sync_status(
     db: Session = Depends(get_db),
     _: None = Depends(require_session),
 ) -> dict:
-    global _status_cache
-    client = IBISClient()
-    result = run_sync(db, client)
+    """Talar om ifall en synk pågår och sammanfattar den senaste körningen, så
+    frontend vet när den bakgrundskörda synken blivit klar."""
+    with _sync_state_lock:
+        pagar = _sync_state["running"]
 
-    new_status = _build_status_response(db)
-    with _cache_lock:
-        _status_cache = new_status
-
-    return {
-        "ok": result.ok,
-        "matcher_tillagda": result.matches_added,
-        "varningar": result.warnings,
-        "startad": result.started_at.isoformat(),
-        "klar": result.finished_at.isoformat(),
-    }
+    log_row = db.scalars(
+        select(SyncLog).order_by(SyncLog.started_at.desc()).limit(1)
+    ).first()
+    senaste = None
+    if log_row is not None:
+        senaste = {
+            "startad": log_row.started_at.isoformat(),
+            "klar": log_row.finished_at.isoformat() if log_row.finished_at else None,
+            "ok": log_row.ok,
+            "matcher_tillagda": log_row.matches_added,
+            "varningar": list(log_row.warnings or []),
+        }
+    return {"pagar": pagar, "senaste": senaste}
 
 
 # ---------------------------------------------------------------------------

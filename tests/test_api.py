@@ -4,6 +4,8 @@ Databasen är en in-memory SQLite-instans per test.
 Synken är mockad – inga nätverksanrop.
 """
 
+import threading
+import time
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -13,24 +15,32 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import app.api as api_mod
 from app.api import app, get_db, _clear_status_cache, _clear_live_cache
 from app.auth import require_session
 from app.ibis_client import IBISClient, IBISLineups
 from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
-from app.sync import SyncResult, _now_naive
+from app.sync import _now_naive
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+def _reset_sync_state():
+    with api_mod._sync_state_lock:
+        api_mod._sync_state["running"] = False
+
+
 @pytest.fixture(autouse=True)
 def clear_cache():
     _clear_status_cache()
     _clear_live_cache()
+    _reset_sync_state()
     yield
     _clear_status_cache()
     _clear_live_cache()
+    _reset_sync_state()
 
 
 @pytest.fixture
@@ -109,17 +119,6 @@ def add_player(db, player_id, name="Spelare", shirt_no="9", is_goalkeeper=False)
 
 def add_player_team(db, player_id, team):
     db.add(PlayerTeam(player_id=player_id, team=team))
-
-
-def make_sync_result(ok=True, matches_added=0, warnings=None) -> SyncResult:
-    return SyncResult(
-        ok=ok,
-        matches_added=matches_added,
-        warnings=warnings or [],
-        started_at=datetime(2026, 8, 27, 10, 0),
-        finished_at=datetime(2026, 8, 27, 10, 1),
-        log_id=1,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -378,63 +377,126 @@ class TestTeamFilter:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/sync
+# POST /api/sync – startar synken i bakgrunden och svarar direkt (SPEC 3.5)
 # ---------------------------------------------------------------------------
 
 class TestPostSync:
-    def test_sync_kors_och_returnerar_ok(self, api_client, monkeypatch):
-        monkeypatch.setattr("app.api.run_sync", lambda db, client: make_sync_result(
-            ok=True, matches_added=5,
-        ))
+    def test_startar_synk_i_bakgrunden_och_svarar_direkt(self, api_client, monkeypatch):
+        ran = threading.Event()
+
+        def fake_worker():
+            try:
+                ran.set()
+            finally:
+                _reset_sync_state()
+
+        monkeypatch.setattr("app.api._sync_worker", fake_worker)
 
         response = api_client.post("/api/sync")
 
         assert response.status_code == 200
         data = response.json()
-        assert data["ok"] is True
-        assert data["matcher_tillagda"] == 5
-        assert data["varningar"] == []
-        assert "startad" in data
-        assert "klar" in data
+        assert data["startad"] is True
+        assert data["pagar"] is True
+        assert ran.wait(2)
 
-    def test_misslyckad_sync_returnerar_ok_false(self, api_client, monkeypatch):
-        monkeypatch.setattr("app.api.run_sync", lambda db, client: make_sync_result(
-            ok=False, warnings=["Synken avbröts med fel: nätverksfel"],
-        ))
+    def test_andra_synk_medan_en_pagar_startar_inte_en_till(self, api_client, monkeypatch):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
 
-        response = api_client.post("/api/sync")
+        def fake_worker():
+            calls.append(1)
+            started.set()
+            release.wait(3)
+            _reset_sync_state()
 
-        assert response.status_code == 200
-        data = response.json()
-        assert data["ok"] is False
-        assert len(data["varningar"]) > 0
+        monkeypatch.setattr("app.api._sync_worker", fake_worker)
 
-    def test_sync_bygger_om_cachen(self, db, api_client, monkeypatch):
-        monkeypatch.setattr("app.api.run_sync", lambda db, client: make_sync_result())
+        first = api_client.post("/api/sync")
+        assert started.wait(2)
+        second = api_client.post("/api/sync")
 
-        # Hämta status (tom cache → byggs)
+        assert first.json()["startad"] is True
+        assert second.json()["startad"] is False
+        assert second.json()["pagar"] is True
+
+        release.set()
+        for _ in range(100):
+            with api_mod._sync_state_lock:
+                if not api_mod._sync_state["running"]:
+                    break
+            time.sleep(0.02)
+        assert calls == [1]
+
+    def test_cachen_byggs_om_nar_bakgrundssynken_blir_klar(self, db, api_client, monkeypatch):
         before = api_client.get("/api/status").json()
         assert before["rakningar"]["tillgangliga"] == 0
 
-        # Lägg till en spelare med en spelad match i DB, kör sync → cache byggs om
         add_match(db, 1, "B", datetime(2020, 1, 1))
         add_player(db, 99, "Ny", "1")
         add_appearance(db, 1, 99, "Ny")
         db.flush()
+
+        done = threading.Event()
+
+        def fake_worker():
+            try:
+                new_status = api_mod._build_status_response(db)
+                with api_mod._cache_lock:
+                    api_mod._status_cache = new_status
+            finally:
+                _reset_sync_state()
+                done.set()
+
+        monkeypatch.setattr("app.api._sync_worker", fake_worker)
+
         api_client.post("/api/sync")
+        assert done.wait(2)
 
         after = api_client.get("/api/status").json()
         assert after["rakningar"]["tillgangliga"] == 1
 
-    def test_sync_varningar_inkluderas_i_svar(self, api_client, monkeypatch):
-        monkeypatch.setattr("app.api.run_sync", lambda db, client: make_sync_result(
-            warnings=["Avbruten match utan resultat"],
-        ))
 
-        response = api_client.post("/api/sync")
+# ---------------------------------------------------------------------------
+# GET /api/sync/status – pågår-flagga plus sammanfattning av senaste körningen
+# ---------------------------------------------------------------------------
+
+class TestGetSyncStatus:
+    def test_ingen_synk_och_ingen_logg(self, api_client):
+        response = api_client.get("/api/sync/status")
+
+        assert response.status_code == 200
         data = response.json()
+        assert data["pagar"] is False
+        assert data["senaste"] is None
 
-        assert "Avbruten match utan resultat" in data["varningar"]
+    def test_sammanfattar_senaste_synkloggen(self, db, api_client):
+        db.add(SyncLog(
+            started_at=datetime(2026, 8, 27, 3, 0),
+            finished_at=datetime(2026, 8, 27, 3, 2),
+            matches_added=4,
+            warnings=["Match 9 avbruten utan resultat"],
+            ok=True,
+        ))
+        db.flush()
+
+        data = api_client.get("/api/sync/status").json()
+
+        assert data["pagar"] is False
+        assert data["senaste"]["ok"] is True
+        assert data["senaste"]["matcher_tillagda"] == 4
+        assert data["senaste"]["klar"] is not None
+        assert "Match 9 avbruten utan resultat" in data["senaste"]["varningar"]
+
+    def test_pagar_flagga_speglar_sync_state(self, api_client):
+        with api_mod._sync_state_lock:
+            api_mod._sync_state["running"] = True
+        try:
+            data = api_client.get("/api/sync/status").json()
+            assert data["pagar"] is True
+        finally:
+            _reset_sync_state()
 
 
 # ---------------------------------------------------------------------------

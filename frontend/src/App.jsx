@@ -242,6 +242,30 @@ export default function App() {
     return 'Något gick fel. Försök igen.'
   }
 
+  // Synken körs i bakgrunden på servern. Polla statusendpointen tills den är
+  // klar. Ingen kort tidsgräns – knappen ska inte se ut att ha misslyckats
+  // bara för att synken tar tid. Efter tio minuter slutar vi ändå vänta och
+  // läser in listan med det som hunnit bli klart.
+  async function waitForSyncDone() {
+    for (let i = 0; i < 300; i++) {
+      await new Promise(r => setTimeout(r, 2000))
+      let res
+      try {
+        res = await fetch('/api/sync/status')
+      } catch {
+        // Nätverksglapp mitt i synken – fortsätt polla.
+        continue
+      }
+      if (res.status === 401) {
+        setAuthed(false)
+        return
+      }
+      if (!res.ok) continue
+      const s = await res.json()
+      if (!s.pagar) return
+    }
+  }
+
   async function handleSync() {
     setSyncing(true)
     setError(null)
@@ -252,9 +276,12 @@ export default function App() {
         return
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      // Endpointen svarar direkt att synken startat (eller att en redan
+      // pågår). Vänta tills den blivit klar och uppdatera sedan listan.
+      await waitForSyncDone()
       await fetchStatus()
     } catch {
-      setError('Synken misslyckades. Prova igen.')
+      setError('Kunde inte uppdatera just nu. Prova igen.')
     } finally {
       setSyncing(false)
     }

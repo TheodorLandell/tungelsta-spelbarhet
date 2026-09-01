@@ -261,26 +261,37 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
                         continue
 
                     # Truppen publiceras i iBIS före matchstart, så lineups
-                    # hämtas för alla matcher – spelade, kommande och cup/
-                    # träning – oavsett status eller CompetitionTypeID. Är
-                    # lineups tom sparas inget (players blir []). Det är
-                    # counts_for_rules (satt ovan) som avgör om matchen når
-                    # regelmotorn, se app/status.py – sync.py sparar bara
-                    # underlaget.
-                    #
-                    # Färdigrapporterad match med sparade appearances hämtas
-                    # inte om (SPEC 3.5). Alla andra hämtas om varje synk så
-                    # att en ändrad trupp eller uppdaterad statistik speglas.
+                    # hämtas även för matcher som ännu inte spelats. Är lineups
+                    # tom sparas inget (players blir []). Det är counts_for_rules
+                    # (satt ovan) som avgör om matchen når regelmotorn, se
+                    # app/status.py – sync.py sparar bara underlaget.
+                    kickoff = parse_kickoff(match.MatchDateTime).replace(tzinfo=None)
+
+                    # En färdigrapporterad match som redan har appearances
+                    # hämtas inte om (SPEC 3.5). Allt annat hämtas: matcher utan
+                    # appearances, och spelade matcher som ännu inte är
+                    # färdigrapporterade – så statistiken hålls färsk om
+                    # sekretariatet rättar något i efterhand.
                     if (
-                        not is_new
-                        and match.FinalResultCreatedTS
+                        match.FinalResultCreatedTS
                         and _has_appearances(db, match.MatchID)
+                    ):
+                        continue
+
+                    # Kommande matcher: trupper publiceras inte tidigare än sju
+                    # dagar före kickoff, så matcher längre bort än så hämtas
+                    # inte – annars hämtas lineups för hela säsongen vid varje
+                    # synk och jobbet tar minuter. Spelade matcher berörs inte
+                    # av tidsgränsen; de följer regeln ovan oavsett hur långt
+                    # bak de ligger.
+                    if (
+                        not is_played(match)
+                        and kickoff - _now_naive() > timedelta(days=7)
                     ):
                         continue
 
                     lineups = client.fetch_lineups(match.MatchID)
                     players = get_team_players(lineups, team_id)
-                    kickoff = parse_kickoff(match.MatchDateTime).replace(tzinfo=None)
                     _save_appearances(db, match.MatchID, players, kickoff)
 
             # Spara trupp-spelare från lagets Players[]-lista (även de utan matcher)

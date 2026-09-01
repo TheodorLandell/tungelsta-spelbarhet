@@ -3,7 +3,7 @@ Tester för synkjobbet. Inga nätverksanrop – klienten är mockad.
 Databasen är en in-memory SQLite-instans per test.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,6 +17,7 @@ from app.sync import (
     SyncResult,
     _has_appearances,
     _match_status,
+    _now_naive,
     _opponent,
     _upsert_match,
     _upsert_player,
@@ -28,6 +29,11 @@ TEAM_B_ID = 17541
 OTHER_ID = 9999
 
 MOCK_SETTINGS = SimpleNamespace(season_id=44, team_a_id=TEAM_A_ID, team_b_id=TEAM_B_ID)
+
+
+def soon(days: int = 3) -> str:
+    """iBIS-tidssträng för en kommande match `days` dagar fram i tiden."""
+    return (_now_naive() + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +266,7 @@ class TestRunSync:
 
         # Lineups hämtas ändå (truppen kan vara publicerad i förväg), men
         # mock-klienten ger en tom trupp om inget annat anges – då sparas inget.
-        m = make_match_dict(1002, match_datetime="2099-01-01T19:00:00")
+        m = make_match_dict(1002, match_datetime=soon())
         client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
 
         log = run_sync(db, client)
@@ -274,9 +280,9 @@ class TestRunSync:
     def test_schemalagd_match_med_publicerad_trupp_ger_appearances(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
 
-        # Konkret fall ur buggrapporten: truppen är publicerad i iBIS långt
-        # innan matchen är spelad, och ska sparas så registreringsvyn kan visa den.
-        m = make_match_dict(1767137, match_datetime="2099-01-01T19:00:00")
+        # Konkret fall ur buggrapporten: truppen är publicerad i iBIS innan
+        # matchen är spelad, och ska sparas så registreringsvyn kan visa den.
+        m = make_match_dict(1767137, match_datetime=soon())
         lineups = make_lineups_dict(1767137, away_players=[make_player_dict(42, "Kalle", "7")])
         client = build_client(
             team_a_dict=make_team_dict(TEAM_A_ID, [m]),
@@ -297,7 +303,7 @@ class TestRunSync:
 
         # En ännu inte färdigrapporterad match ska hämtas om varje synk, så
         # en ändrad trupp speglas – oavsett om matchen redan är spelad eller ej.
-        m = make_match_dict(1009, match_datetime="2099-01-01T19:00:00")
+        m = make_match_dict(1009, match_datetime=soon())
         client = build_client(
             team_a_dict=make_team_dict(TEAM_A_ID, [m]),
             lineups_by_id={1009: make_lineups_dict(1009, away_players=[make_player_dict(1)])},
@@ -313,6 +319,44 @@ class TestRunSync:
         client2.fetch_lineups.assert_called_once_with(1009)
         apps = db.scalars(select(Appearance).where(Appearance.match_id == 1009)).all()
         assert {a.player_id for a in apps} == {1, 2}
+
+    def test_kommande_match_langre_bort_an_sju_dagar_hamtas_inte(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Trupper publiceras inte tidigare än sju dagar före kickoff – en match
+        # längre bort än så ska inte trigga något lineup-anrop.
+        m = make_match_dict(1010, match_datetime=soon(10))
+        lineups = make_lineups_dict(1010, away_players=[make_player_dict(5)])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={1010: lineups},
+        )
+
+        run_sync(db, client)
+
+        client.fetch_lineups.assert_not_called()
+        assert db.scalars(
+            select(Appearance).where(Appearance.match_id == 1010)
+        ).all() == []
+        # Matchraden sparas ändå så den syns i matchlistan.
+        assert db.get(Match, 1010) is not None
+
+    def test_kommande_match_inom_sju_dagar_hamtas(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = make_match_dict(1011, match_datetime=soon(3))
+        lineups = make_lineups_dict(1011, away_players=[make_player_dict(6, "Kalle", "7")])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={1011: lineups},
+        )
+
+        run_sync(db, client)
+
+        client.fetch_lineups.assert_called_once_with(1011)
+        apps = db.scalars(select(Appearance).where(Appearance.match_id == 1011)).all()
+        assert len(apps) == 1
+        assert apps[0].player_id == 6
 
     def test_instaelld_match_sparas_som_cancelled(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
