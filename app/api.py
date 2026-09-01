@@ -118,19 +118,57 @@ def _clear_live_cache() -> None:
         _live_state["refreshing"] = False
 
 
+def _record_failed_sync(message: str) -> None:
+    """Skriver en misslyckad rad i sync_log när bakgrundstasken kraschar utan
+    att run_sync hann logga själv. Då syns felet i sync_log och inte bara i
+    Railway-loggen."""
+    try:
+        with SessionLocal() as db:
+            now = _now_naive()
+            db.add(SyncLog(
+                started_at=now,
+                finished_at=now,
+                matches_added=0,
+                warnings=[message],
+                ok=False,
+            ))
+            db.commit()
+    except Exception:
+        log.exception("Kunde inte skriva misslyckad synk till sync_log")
+
+
 def _sync_worker() -> None:
     """Kör synken och bygger om statuscachen. Körs i en bakgrundstråd så att
-    POST /api/sync kan svara direkt utan att hålla HTTP-anropet öppet."""
+    POST /api/sync kan svara direkt utan att hålla HTTP-anropet öppet.
+
+    Bakgrundstråden får inte svälja fel: en misslyckad synk ska synas både i
+    Railway-loggen (log.*) och i sync_log. run_sync fångar sina egna fel och
+    skriver dem till sync_log – här loggas utfallet till stdout så det når
+    Railway, och ett oväntat fel utanför run_sync fångas och skrivs till
+    sync_log innan tråden dör."""
     global _status_cache
     try:
         client = IBISClient()
         with SessionLocal() as db:
-            run_sync(db, client)
+            result = run_sync(db, client)
+            if result.ok:
+                log.info(
+                    "Bakgrundssynk klar: %d matcher tillagda, %d varning(ar)",
+                    result.matches_added, len(result.warnings),
+                )
+            else:
+                log.error(
+                    "Bakgrundssynk misslyckades: %s",
+                    "; ".join(result.warnings) or "okänt fel",
+                )
+            for w in result.warnings:
+                log.warning("Synk-varning: %s", w)
             new_status = _build_status_response(db)
         with _cache_lock:
             _status_cache = new_status
     except Exception:
         log.exception("Bakgrundssynken avbröts med ett oväntat fel")
+        _record_failed_sync("Bakgrundssynken avbröts med ett oväntat fel")
     finally:
         with _sync_state_lock:
             _sync_state["running"] = False

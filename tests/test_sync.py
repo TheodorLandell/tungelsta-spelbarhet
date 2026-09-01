@@ -899,3 +899,78 @@ class TestGoalkeeperFlag:
 
         assert run_sync(db, client).ok is True
         assert db.get(Player, 52).is_goalkeeper is True
+
+
+# ---------------------------------------------------------------------------
+# Synken robust mot enskilda fel (SPEC 3.5)
+#
+# Ett valideringsfel på EN match ska loggas som varning i sync_log och matchen
+# hoppas över – resten av synken fortsätter.
+# ---------------------------------------------------------------------------
+
+class TestSyncRobusthet:
+    def test_ogiltig_lineup_pa_en_match_avbryter_inte_synken(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        bad = make_match_dict(7001, goals_home=1, goals_away=0,
+                              final_result_ts="2020-01-15T21:00:00")
+        good = make_match_dict(7002, goals_home=2, goals_away=1,
+                               final_result_ts="2020-01-15T21:00:00")
+        good_lineups = make_lineups_dict(
+            7002, away_players=[make_player_dict(50, "Ok", "3")]
+        )
+
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [bad, good]),
+            lineups_by_id={7002: good_lineups},
+        )
+
+        def fetch_lineups(match_id):
+            if match_id == 7001:
+                # iBIS returnerar ogiltig data: PlayerID går inte att tolka som
+                # tal → pydantic-valideringsfel, precis som ShirtNo-buggen.
+                return IBISLineups.model_validate({
+                    "MatchID": 7001, "HomeTeamID": OTHER_ID, "AwayTeamID": TEAM_A_ID,
+                    "HomeTeamPlayers": [],
+                    "AwayTeamPlayers": [
+                        {"PlayerID": "inte-ett-tal", "MatchPlayerID": 1, "Name": "X"},
+                    ],
+                })
+            return IBISLineups.model_validate(good_lineups)
+
+        client.fetch_lineups.side_effect = fetch_lineups
+
+        result = run_sync(db, client)
+
+        # Synken avbröts inte
+        assert result.ok is True
+        # Varningen om den trasiga matchen hamnade i sync_log
+        assert any("7001" in w for w in result.warnings)
+        db_log = db.get(SyncLog, result.log_id)
+        assert db_log.ok is True
+        assert any("7001" in w for w in db_log.warnings)
+        # Resten av synken fortsatte: den friska matchen fick sina appearances
+        apps = db.scalars(select(Appearance).where(Appearance.match_id == 7002)).all()
+        assert len(apps) == 1
+        assert apps[0].player_id == 50
+        # Båda matchraderna sparades ändå så de syns i matchlistan
+        assert db.get(Match, 7001) is not None
+        assert db.get(Match, 7002) is not None
+
+    def test_shirtno_som_int_i_lineups_sparas_som_str(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = make_match_dict(7100, goals_home=1, goals_away=0,
+                            final_result_ts="2020-01-15T21:00:00")
+        # ShirtNo som int – tidigare kraschade IBISLineups-valideringen här
+        lineups = make_lineups_dict(7100, away_players=[make_player_dict(60, "Kalle", 7)])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={7100: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+
+        app = db.get(Appearance, (7100, 60))
+        assert app is not None
+        assert app.shirt_no == "7"

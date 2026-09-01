@@ -122,7 +122,8 @@ def _upsert_player(db: Session, p: IBISMatchPlayer, kickoff: datetime) -> None:
 
 def _upsert_squad_player(db: Session, p: IBISSquadPlayer, sync_at: datetime) -> None:
     """Sparar en trupp-spelare som ännu inte förekommer i någon lineup."""
-    shirt = str(p.ShirtNo) if p.ShirtNo is not None else None
+    # ShirtNo är redan normaliserad till str | None av modellen.
+    shirt = p.ShirtNo
     is_gk = is_goalkeeper_player(p)
     has_position = bool((p.Position or "").strip())
     existing = db.get(Player, p.PlayerID)
@@ -201,6 +202,68 @@ def _save_appearances(
             existing.penalty_minutes = penalty_minutes
 
 
+def _sync_one_match(
+    db: Session,
+    client: IBISClient,
+    match: IBISMatch,
+    team_label: str,
+    team_id: int,
+    raw_by_match: dict[int, dict],
+    counts_for_rules: bool,
+    warnings: list[str],
+) -> bool:
+    """
+    Synkar en enskild match: sparar matchraden och, när det är läge, hämtar
+    lineups och sparar appearances. Returnerar True om matchraden var ny.
+
+    Anropas inom en try/except i run_sync – kastar den ett undantag hoppas
+    matchen över och synken fortsätter med nästa.
+    """
+    raw = raw_by_match.get(match.MatchID, match.model_dump(mode="json"))
+    _db_match, is_new = _upsert_match(
+        db, match, team_label, team_id, raw,
+        counts_for_rules=counts_for_rules,
+    )
+
+    # Inställda matcher hoppas över helt (SPEC punkt 1) – de spelas aldrig och
+    # får aldrig en publicerad trupp.
+    if match.Cancelled:
+        return is_new
+
+    # Avbruten utan resultat: logga varning, hoppa över appearances
+    if match.Abandoned and not is_played(match):
+        warnings.append(
+            f"Match {match.MatchID} ({match.MatchDateTime[:10]}): "
+            "avbruten utan registrerat resultat – hoppas över"
+        )
+        return is_new
+
+    # Truppen publiceras i iBIS före matchstart, så lineups hämtas även för
+    # matcher som ännu inte spelats. Är lineups tom sparas inget (players blir
+    # []). Det är counts_for_rules som avgör om matchen når regelmotorn, se
+    # app/status.py – sync.py sparar bara underlaget.
+    kickoff = parse_kickoff(match.MatchDateTime).replace(tzinfo=None)
+
+    # En färdigrapporterad match som redan har appearances hämtas inte om
+    # (SPEC 3.5). Allt annat hämtas: matcher utan appearances, och spelade
+    # matcher som ännu inte är färdigrapporterade – så statistiken hålls färsk
+    # om sekretariatet rättar något i efterhand.
+    if match.FinalResultCreatedTS and _has_appearances(db, match.MatchID):
+        return is_new
+
+    # Kommande matcher: trupper publiceras inte tidigare än sju dagar före
+    # kickoff, så matcher längre bort än så hämtas inte – annars hämtas lineups
+    # för hela säsongen vid varje synk och jobbet tar minuter. Spelade matcher
+    # berörs inte av tidsgränsen.
+    if not is_played(match) and kickoff - _now_naive() > timedelta(days=7):
+        return is_new
+
+    lineups = client.fetch_lineups(match.MatchID)
+    players = get_team_players(lineups, team_id)
+    _save_appearances(db, match.MatchID, players, kickoff)
+    return is_new
+
+
 def run_sync(db: Session, client: IBISClient) -> SyncResult:
     """
     Hämtar matchdata från iBIS och sparar i databasen.
@@ -238,61 +301,22 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
             for comp in team.Competitions:
                 counts_for_rules = comp.CompetitionTypeID == 1
                 for match in comp.Matches:
-                    raw = raw_by_match.get(match.MatchID, match.model_dump(mode="json"))
-                    db_match, is_new = _upsert_match(
-                        db, match, team_label, team_id, raw,
-                        counts_for_rules=counts_for_rules,
-                    )
-
-                    if is_new:
-                        matches_added += 1
-
-                    # Inställda matcher hoppas över helt (SPEC punkt 1) – de
-                    # spelas aldrig och får aldrig en publicerad trupp.
-                    if match.Cancelled:
-                        continue
-
-                    # Avbruten utan resultat: logga varning, hoppa över appearances
-                    if match.Abandoned and not is_played(match):
+                    # Ett fel på EN match (t.ex. iBIS returnerar ett fält i fel
+                    # typ i lineups-svaret) får inte avbryta hela synken. Logga
+                    # som varning i sync_log, hoppa över matchen och fortsätt.
+                    try:
+                        is_new = _sync_one_match(
+                            db, client, match, team_label, team_id,
+                            raw_by_match, counts_for_rules, warnings,
+                        )
+                    except Exception as exc:
                         warnings.append(
                             f"Match {match.MatchID} ({match.MatchDateTime[:10]}): "
-                            "avbruten utan registrerat resultat – hoppas över"
+                            f"hoppades över efter fel – {exc}"
                         )
                         continue
-
-                    # Truppen publiceras i iBIS före matchstart, så lineups
-                    # hämtas även för matcher som ännu inte spelats. Är lineups
-                    # tom sparas inget (players blir []). Det är counts_for_rules
-                    # (satt ovan) som avgör om matchen når regelmotorn, se
-                    # app/status.py – sync.py sparar bara underlaget.
-                    kickoff = parse_kickoff(match.MatchDateTime).replace(tzinfo=None)
-
-                    # En färdigrapporterad match som redan har appearances
-                    # hämtas inte om (SPEC 3.5). Allt annat hämtas: matcher utan
-                    # appearances, och spelade matcher som ännu inte är
-                    # färdigrapporterade – så statistiken hålls färsk om
-                    # sekretariatet rättar något i efterhand.
-                    if (
-                        match.FinalResultCreatedTS
-                        and _has_appearances(db, match.MatchID)
-                    ):
-                        continue
-
-                    # Kommande matcher: trupper publiceras inte tidigare än sju
-                    # dagar före kickoff, så matcher längre bort än så hämtas
-                    # inte – annars hämtas lineups för hela säsongen vid varje
-                    # synk och jobbet tar minuter. Spelade matcher berörs inte
-                    # av tidsgränsen; de följer regeln ovan oavsett hur långt
-                    # bak de ligger.
-                    if (
-                        not is_played(match)
-                        and kickoff - _now_naive() > timedelta(days=7)
-                    ):
-                        continue
-
-                    lineups = client.fetch_lineups(match.MatchID)
-                    players = get_team_players(lineups, team_id)
-                    _save_appearances(db, match.MatchID, players, kickoff)
+                    if is_new:
+                        matches_added += 1
 
             # Spara trupp-spelare från lagets Players[]-lista (även de utan matcher)
             squad_at = _now_naive()

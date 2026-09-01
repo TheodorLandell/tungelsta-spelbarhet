@@ -25,6 +25,44 @@ MAX_RETRIES = 3
 # ---------------------------------------------------------------------------
 # Pydantic-modeller – fältnamn matchar iBIS exakt
 # ---------------------------------------------------------------------------
+#
+# iBIS är inte konsekvent mellan endpoints: samma fält kan komma som int i ett
+# svar och som str i ett annat (ShirtNo är int i lineups men str i lagobjektets
+# Players[]), och tomma talfält kan komma som "" i stället för null. Modellerna
+# är därför avsiktligt toleranta – hellre normalisera än att avbryta synken mitt
+# i en match. Två hjälpvalidatorer används genomgående:
+#   _coerce_str      – normaliserar tal/sträng till str (för visningsfält)
+#   _coerce_opt_int  – tomma strängar → None, i övrigt låt pydantic tolka talet
+
+
+def _coerce_str(v: Any) -> Any:
+    """Normaliserar ett fält som kan komma som int eller str till str.
+
+    None förblir None. Heltalsflyttal (5.0) blir "5". Andra typer lämnas
+    orörda så att pydantic får klaga på det som verkligen är fel.
+    """
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return v  # låt pydantic avvisa – bool i ett strängfält är alltid fel
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else str(v)
+    return v
+
+
+def _coerce_opt_int(v: Any) -> Any:
+    """Gör ett valfritt heltalsfält tolerant mot iBIS-inkonsekvens.
+
+    "" och blanktecken → None. Andra strängar ("5") lämnas till pydantic som
+    tolkar dem som tal i lax-läge. Icke-strängar lämnas orörda.
+    """
+    if isinstance(v, str):
+        s = v.strip()
+        return None if s == "" else s
+    return v
+
 
 class IBISMatchPlayer(BaseModel):
     PlayerID: int
@@ -37,6 +75,19 @@ class IBISMatchPlayer(BaseModel):
     PositionID: int | None = None
     Position: str | None = None
     LicensedAssociationID: int | None = None
+
+    @field_validator("ShirtNo", mode="before")
+    @classmethod
+    def _shirt_to_str(cls, v: Any) -> Any:
+        return _coerce_str(v)
+
+    @field_validator(
+        "Goals", "Assists", "PenaltyMinutes", "PositionID",
+        "LicensedAssociationID", mode="before",
+    )
+    @classmethod
+    def _opt_int(cls, v: Any) -> Any:
+        return _coerce_opt_int(v)
 
 
 class IBISMatch(BaseModel):
@@ -65,6 +116,18 @@ class IBISMatch(BaseModel):
             return v
         return str(v).lower() in ("true", "1", "yes")
 
+    @field_validator(
+        "GoalsHomeTeam", "GoalsAwayTeam", "Round", "MatchStatus", mode="before",
+    )
+    @classmethod
+    def _opt_int(cls, v: Any) -> Any:
+        return _coerce_opt_int(v)
+
+    @field_validator("HomeTeam", "AwayTeam", "RoundName", mode="before")
+    @classmethod
+    def _str_fields(cls, v: Any) -> Any:
+        return _coerce_str(v)
+
 
 class IBISCompetition(BaseModel):
     CompetitionID: int
@@ -76,9 +139,21 @@ class IBISCompetition(BaseModel):
 class IBISSquadPlayer(BaseModel):
     PlayerID: int
     Name: str
-    ShirtNo: int | None = None
+    # ShirtNo kommer som str här men som int i lineups – normalisera alltid
+    # till str så resten av koden slipper bry sig om varifrån spelaren kom.
+    ShirtNo: str | None = None
     PositionID: int | None = None
     Position: str | None = None
+
+    @field_validator("ShirtNo", mode="before")
+    @classmethod
+    def _shirt_to_str(cls, v: Any) -> Any:
+        return _coerce_str(v)
+
+    @field_validator("PositionID", mode="before")
+    @classmethod
+    def _opt_int(cls, v: Any) -> Any:
+        return _coerce_opt_int(v)
 
 
 class IBISTeam(BaseModel):

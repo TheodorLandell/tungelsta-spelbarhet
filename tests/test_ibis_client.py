@@ -13,6 +13,7 @@ from app.ibis_client import (
     IBISLineups,
     IBISMatch,
     IBISMatchPlayer,
+    IBISSquadPlayer,
     IBISTeam,
     filter_series_competitions,
     get_team_players,
@@ -257,3 +258,87 @@ class TestLineupsParsing:
         p = lineups_played.AwayTeamPlayers[0]
         assert isinstance(p.PlayerID, int)
         assert isinstance(p.Name, str)
+
+
+# ---------------------------------------------------------------------------
+# ShirtNo och andra fält där iBIS är inkonsekvent mellan endpoints
+#
+# ShirtNo kommer som int i lineups-svaret men som str i lagobjektets Players[].
+# Modellerna ska acceptera båda och normalisera till str. null ska fungera.
+# ---------------------------------------------------------------------------
+
+class TestShirtNoCoercion:
+    def _match_player(self, shirt) -> IBISMatchPlayer:
+        return IBISMatchPlayer.model_validate({
+            "PlayerID": 1, "MatchPlayerID": 100, "Name": "Test", "ShirtNo": shirt,
+        })
+
+    def _squad_player(self, shirt) -> IBISSquadPlayer:
+        return IBISSquadPlayer.model_validate({
+            "PlayerID": 1, "Name": "Test", "ShirtNo": shirt,
+        })
+
+    def test_matchspelare_shirtno_int_blir_str(self):
+        assert self._match_player(5).ShirtNo == "5"
+
+    def test_matchspelare_shirtno_str_oforandrad(self):
+        assert self._match_player("5").ShirtNo == "5"
+
+    def test_matchspelare_shirtno_int_och_str_ger_samma(self):
+        assert self._match_player(5).ShirtNo == self._match_player("5").ShirtNo
+
+    def test_matchspelare_shirtno_null(self):
+        assert self._match_player(None).ShirtNo is None
+
+    def test_truppspelare_shirtno_int_blir_str(self):
+        assert self._squad_player(5).ShirtNo == "5"
+
+    def test_truppspelare_shirtno_str_oforandrad(self):
+        assert self._squad_player("5").ShirtNo == "5"
+
+    def test_truppspelare_shirtno_int_och_str_ger_samma(self):
+        assert self._squad_player(5).ShirtNo == self._squad_player("5").ShirtNo
+
+    def test_truppspelare_shirtno_null(self):
+        assert self._squad_player(None).ShirtNo is None
+
+    def test_lineups_med_int_shirtno_validerar(self):
+        # Konkret fall ur buggrapporten: iBIS skickar ShirtNo som int i
+        # lineups-svaret. Tidigare kraschade hela IBISLineups-valideringen.
+        lineups = IBISLineups.model_validate({
+            "MatchID": 1, "HomeTeamID": 1, "AwayTeamID": 2,
+            "HomeTeamPlayers": [
+                {"PlayerID": 5, "MatchPlayerID": 50, "Name": "Femman", "ShirtNo": 5},
+            ],
+            "AwayTeamPlayers": [],
+        })
+        assert lineups.HomeTeamPlayers[0].ShirtNo == "5"
+
+    def test_tomt_talfalt_blir_none(self):
+        # iBIS skickar ibland "" i stället för null för tomma talfält.
+        p = IBISMatchPlayer.model_validate({
+            "PlayerID": 1, "MatchPlayerID": 100, "Name": "Test",
+            "Goals": "", "Assists": "  ", "PenaltyMinutes": None,
+        })
+        assert p.Goals is None
+        assert p.Assists is None
+        assert p.PenaltyMinutes is None
+
+    def test_talfalt_som_strang_tolkas(self):
+        p = IBISMatchPlayer.model_validate({
+            "PlayerID": 1, "MatchPlayerID": 100, "Name": "Test",
+            "Goals": "2", "Assists": "1",
+        })
+        assert p.Goals == 2
+        assert p.Assists == 1
+
+    def test_match_resultat_som_strang_tolkas(self):
+        m = IBISMatch.model_validate({
+            "MatchID": 1, "CompetitionID": 100, "CompetitionTypeID": 1,
+            "HomeTeamID": 1, "AwayTeamID": 2,
+            "MatchDateTime": "2026-09-19T13:00:00",
+            "Cancelled": False, "Postponed": False, "Abandoned": False,
+            "GoalsHomeTeam": "3", "GoalsAwayTeam": "",
+        })
+        assert m.GoalsHomeTeam == 3
+        assert m.GoalsAwayTeam is None

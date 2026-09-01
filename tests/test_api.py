@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -20,7 +20,7 @@ from app.api import app, get_db, _clear_status_cache, _clear_live_cache
 from app.auth import require_session
 from app.ibis_client import IBISClient, IBISLineups
 from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
-from app.sync import _now_naive
+from app.sync import SyncResult, _now_naive
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +456,87 @@ class TestPostSync:
 
         after = api_client.get("/api/status").json()
         assert after["rakningar"]["tillgangliga"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _sync_worker – bakgrundstasken får inte svälja fel (SPEC 3.5)
+#
+# Ett misslyckande ska synas både i Railway-loggen och i sync_log, inte bara i
+# konsolen när synken körs manuellt.
+# ---------------------------------------------------------------------------
+
+class TestSyncWorkerFelhantering:
+    def _mem_sessionmaker(self):
+        eng = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(eng)
+        return sessionmaker(bind=eng, autoflush=True)
+
+    def test_ovantat_fel_skrivs_till_railway_och_sync_log(self, monkeypatch, caplog):
+        make_session = self._mem_sessionmaker()
+        monkeypatch.setattr(api_mod, "SessionLocal", make_session)
+        monkeypatch.setattr(api_mod, "IBISClient", lambda *a, **kw: MagicMock())
+
+        def boom(db, client):
+            raise RuntimeError("iBIS-token gick inte att hämta")
+
+        monkeypatch.setattr(api_mod, "run_sync", boom)
+
+        with api_mod._sync_state_lock:
+            api_mod._sync_state["running"] = True
+
+        with caplog.at_level("ERROR", logger="app.api"):
+            api_mod._sync_worker()
+
+        # running-flaggan är alltid återställd efteråt
+        with api_mod._sync_state_lock:
+            assert api_mod._sync_state["running"] is False
+
+        # Felet syns i Railway-loggen ...
+        assert any(
+            "avbröts med ett oväntat fel" in r.getMessage() for r in caplog.records
+        )
+
+        # ... och i sync_log
+        with make_session() as s:
+            rows = list(s.scalars(select(SyncLog)))
+            assert len(rows) == 1
+            assert rows[0].ok is False
+            assert rows[0].finished_at is not None
+
+    def test_misslyckad_synk_loggas_till_railway(self, monkeypatch, caplog):
+        make_session = self._mem_sessionmaker()
+        monkeypatch.setattr(api_mod, "SessionLocal", make_session)
+        monkeypatch.setattr(api_mod, "IBISClient", lambda *a, **kw: MagicMock())
+
+        now = _now_naive()
+
+        def fake_run_sync(db, client):
+            return SyncResult(
+                ok=False,
+                matches_added=0,
+                warnings=["Synken avbröts med fel: nätverksfel"],
+                started_at=now,
+                finished_at=now,
+                log_id=1,
+            )
+
+        monkeypatch.setattr(api_mod, "run_sync", fake_run_sync)
+
+        with api_mod._sync_state_lock:
+            api_mod._sync_state["running"] = True
+
+        with caplog.at_level("WARNING", logger="app.api"):
+            api_mod._sync_worker()
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Bakgrundssynk misslyckades" in m for m in messages)
+        assert any("nätverksfel" in m for m in messages)
+        with api_mod._sync_state_lock:
+            assert api_mod._sync_state["running"] is False
 
 
 # ---------------------------------------------------------------------------
