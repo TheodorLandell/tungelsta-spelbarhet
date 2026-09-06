@@ -79,7 +79,8 @@ def add_match_raw(db, match_id, team, kickoff, status="scheduled", *,
                   home_team_id=1977, away_team_id=9999, venue="Tungelstahallen",
                   goals_home=None, goals_away=None, round_name="Omgång 1",
                   opponent="Motståndarna", counts_for_rules=True, competition_type=1,
-                  home_team=None, away_team=None, final_result_ts=None):
+                  home_team=None, away_team=None, final_result_ts=None,
+                  date_missing=False):
     raw = {
         "HomeTeamID": home_team_id,
         "AwayTeamID": away_team_id,
@@ -96,7 +97,7 @@ def add_match_raw(db, match_id, team, kickoff, status="scheduled", *,
     db.add(Match(
         match_id=match_id, team=team, competition_id=100,
         kickoff=kickoff, status=status, round_name=round_name, opponent=opponent,
-        counts_for_rules=counts_for_rules,
+        counts_for_rules=counts_for_rules, date_missing=date_missing,
         raw=raw,
     ))
 
@@ -671,6 +672,20 @@ class TestGetMatches:
         row = api_client.get("/api/matches?team=A").json()["matcher"][0]
         assert row["raknas"] is False
         assert row["matchtyp"] == "traningsmatch"
+
+    def test_match_utan_satt_datum_markeras_och_visas_sist(self, db, api_client):
+        add_match_raw(db, 1, "B", datetime(2026, 9, 20, 14), opponent="Riktigt datum")
+        add_match_raw(db, 2, "B", datetime(2026, 1, 1, 0, 0), date_missing=True,
+                      opponent="Skogås/Trångsunds IBK")
+        add_match_raw(db, 3, "B", datetime(2026, 9, 1, 13), opponent="Tidigast")
+        db.flush()
+
+        matcher = api_client.get("/api/matches?team=B").json()["matcher"]
+
+        # Matchen utan datum hamnar sist trots att 1 januari sorterar först.
+        assert [m["match_id"] for m in matcher] == [3, 1, 2]
+        assert matcher[0]["datum_saknas"] is False
+        assert matcher[-1]["datum_saknas"] is True
 
 
 # ---------------------------------------------------------------------------

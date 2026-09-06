@@ -3,12 +3,7 @@ import ShotRegistration from './ShotRegistration'
 import RosterEditor from './RosterEditor'
 import MatchHeader from './MatchHeader'
 import { cacheSquad, loadCachedSquad } from '../lib/shotStore'
-
-function parseKickoff(str) {
-  // Naiv lokaltid från iBIS, "2026-09-19T13:00:00" – tolkas som Europe/Stockholm
-  // på tränarens telefon.
-  return str ? new Date(str) : null
-}
+import { parseKickoff, sortMatchesForList, nextMatchId } from '../lib/matches'
 
 function formatDay(str) {
   const d = parseKickoff(str)
@@ -73,14 +68,23 @@ function MatchListRow({ match, isNext, onSelect, rowRef, liveRow }) {
                     isNext ? 'bg-orange-50' : ''
                   }`}
     >
-      {/* Datum + tid */}
+      {/* Datum + tid. Matcher utan satt datum (SPEC punkt 2) visar "Datum ej
+          satt" i stället för datum och tid. */}
       <div className="w-16 shrink-0">
-        <div className="text-sm font-semibold text-gray-900 leading-tight">
-          {formatDay(match.kickoff)}
-        </div>
-        <div className="text-xs text-gray-500 tabular-nums">
-          {installd ? '—' : formatTime(match.kickoff)}
-        </div>
+        {match.datum_saknas ? (
+          <div className="text-xs font-semibold text-gray-500 leading-tight">
+            Datum ej satt
+          </div>
+        ) : (
+          <>
+            <div className="text-sm font-semibold text-gray-900 leading-tight">
+              {formatDay(match.kickoff)}
+            </div>
+            <div className="text-xs text-gray-500 tabular-nums">
+              {installd ? '—' : formatTime(match.kickoff)}
+            </div>
+          </>
+        )}
       </div>
 
       {/* Motståndare + plats */}
@@ -134,13 +138,11 @@ function MatchListRow({ match, isNext, onSelect, rowRef, liveRow }) {
 function MatchList({ matches, onSelect, liveById }) {
   const nextRef = useRef(null)
 
-  const now = Date.now()
-  const nextId = matches.reduce((acc, m) => {
-    if (acc !== null) return acc
-    if (m.status === 'cancelled') return acc
-    const k = parseKickoff(m.kickoff)
-    return k && k.getTime() >= now ? m.match_id : acc
-  }, null)
+  // Riktiga datum kronologiskt, matcher utan satt datum sist. Autoscrollen
+  // hoppar till första kommande matchen och följer flyttade datum, eftersom
+  // synken nu håller kickoff färsk (SPEC punkt 1).
+  const ordered = sortMatchesForList(matches)
+  const nextId = nextMatchId(ordered, Date.now())
 
   useEffect(() => {
     if (nextRef.current) {
@@ -159,7 +161,7 @@ function MatchList({ matches, onSelect, liveById }) {
   return (
     <div className="border border-gray-200 rounded-xl bg-white divide-y divide-gray-100
                     overflow-hidden">
-      {matches.map(m => (
+      {ordered.map(m => (
         <MatchListRow
           key={m.match_id}
           match={m}

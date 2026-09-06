@@ -23,10 +23,12 @@ def db():
         yield session
 
 
-def add_match(db, match_id, team, kickoff, status="played", counts_for_rules=True):
+def add_match(db, match_id, team, kickoff, status="played", counts_for_rules=True,
+              date_missing=False):
     db.add(OrmMatch(
         match_id=match_id, team=team, competition_id=100,
-        kickoff=kickoff, status=status, counts_for_rules=counts_for_rules, raw={},
+        kickoff=kickoff, status=status, counts_for_rules=counts_for_rules,
+        date_missing=date_missing, raw={},
     ))
 
 
@@ -227,6 +229,43 @@ class TestTraningsmatcherRaknasInte:
 
         assert statuses == {}
         assert warnings == []
+
+
+class TestMatchUtanSattDatum:
+    """
+    En match utan satt datum (date_missing) får aldrig påverka någon spelares
+    kedja eller låsstatus – oavsett kickoff, även om 1 januari har passerat
+    (SPEC punkt 2).
+    """
+
+    def test_date_missing_match_paverkar_inte_lasstatus(self, db):
+        # A-match daterad 1 januari (passerad), spelare utan B-match först.
+        # Räknades den skulle kvalificeringsregeln låsa spelaren direkt.
+        add_match(db, 1, "A", datetime(2026, 1, 1, 0, 0), date_missing=True)
+        add_appearance(db, 1, 42, "Pelle")
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        assert 42 not in statuses
+
+    def test_date_missing_match_nollstaller_inte_befintlig_kedja(self, db):
+        # B, A, A spelade i rad (måste stå över). En A-match utan satt datum
+        # som spelaren inte står i får varken nollställa eller öka kedjan.
+        add_match(db, 1, "B", datetime(2026, 8, 1))
+        add_match(db, 2, "A", datetime(2026, 8, 10))
+        add_match(db, 3, "A", datetime(2026, 1, 1, 0, 0), date_missing=True)
+        add_match(db, 4, "A", datetime(2026, 8, 20))
+        for mid in (1, 2, 4):
+            add_appearance(db, mid, 42, "Pelle")
+        db.flush()
+
+        statuses, _ = get_statuses(db)
+
+        s = statuses[42]
+        assert not s.locked
+        assert s.matches_left == 0
+        assert sorted(s.a_match_ids) == [2, 4]
 
 
 class TestKommandeMatcherMedPublicieradTrupp:

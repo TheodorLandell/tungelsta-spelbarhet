@@ -248,7 +248,12 @@ def _build_status_response(db: Session) -> dict[str, Any]:
     # bland counting_match_ids och kan därför aldrig markera någon.
     counting_match_ids = {
         m.match_id
-        for m in db.scalars(select(Match).where(Match.counts_for_rules.is_(True))).all()
+        for m in db.scalars(
+            select(Match).where(
+                Match.counts_for_rules.is_(True),
+                Match.date_missing.is_(False),
+            )
+        ).all()
     }
     roster_edits_by_player: dict[int, list[RosterEdit]] = {}
     for e in db.scalars(select(RosterEdit)).all():
@@ -600,6 +605,9 @@ def _match_summary(m: Match) -> dict[str, Any]:
         "resultat": resultat,
         "raknas": m.counts_for_rules,
         "matchtyp": matchtyp,
+        # Match utan satt datum (SPEC punkt 2): visas sist i listan med
+        # "Datum ej satt" i stället för datum och tid.
+        "datum_saknas": bool(m.date_missing),
     }
 
 
@@ -760,6 +768,8 @@ def get_matches(
     rows = db.scalars(
         select(Match).where(Match.team == team).order_by(Match.kickoff)
     ).all()
+    # Matcher utan satt datum sist (SPEC punkt 2); i övrigt datumordning.
+    rows = sorted(rows, key=lambda m: (bool(m.date_missing), m.kickoff))
     return {"matcher": [_match_summary(m) for m in rows]}
 
 
@@ -795,6 +805,7 @@ def _ongoing_matches(db: Session) -> list[Match]:
     rows = db.scalars(
         select(Match).where(
             Match.status != "cancelled",
+            Match.date_missing.is_(False),
             Match.kickoff <= now,
             Match.kickoff >= lower,
         )

@@ -12,7 +12,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ibis_client import IBISClient, IBISLineups, IBISTeam
-from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
+from app.models import Appearance, Base, Match, Player, PlayerTeam, ShotEvent, SyncLog
+from app.status import get_statuses
 from app.sync import (
     SyncResult,
     _has_appearances,
@@ -52,6 +53,7 @@ def make_match_dict(
     goals_away=None,
     final_result_ts=None,
     round_name: str = "Omgång 1",
+    match_time_missing: bool = False,
 ) -> dict:
     return {
         "MatchID": match_id,
@@ -71,6 +73,7 @@ def make_match_dict(
         "Round": 1,
         "RoundName": round_name,
         "MatchStatus": None,
+        "MatchTimeMissing": match_time_missing,
     }
 
 
@@ -974,3 +977,251 @@ class TestSyncRobusthet:
         app = db.get(Appearance, (7100, 60))
         assert app is not None
         assert app.shirt_no == "7"
+
+
+# ---------------------------------------------------------------------------
+# Synken uppdaterar befintliga matchrader (buggrapport punkt 1)
+#
+# Synken lade tidigare bara till nya matcher. En match som flyttats i iBIS
+# (nytt MatchDateTime) ska få nytt kickoff, ny status, nytt resultat, ny
+# motståndare, ny hall och ny omgång vid nästa synk – även när lineups hoppas
+# över. Registrerade skott hör till match_id och ska följa med.
+# ---------------------------------------------------------------------------
+
+def _played(match_id: int, when: str, **kw) -> dict:
+    """Ett spelat match-dict med resultat och färdigrapportering samma dag."""
+    return make_match_dict(
+        match_id, match_datetime=when, goals_home=3, goals_away=2,
+        final_result_ts=when[:11] + "21:00:00", **kw,
+    )
+
+
+class TestBefintligMatchUppdateras:
+    def test_andrad_matchdatetime_ger_nytt_kickoff_efter_synk(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Match finns redan med gammalt datum och gammal omgång/motståndare.
+        db.add(Match(
+            match_id=1001, team="A", competition_id=100,
+            kickoff=datetime(2026, 9, 19, 13, 15), status="scheduled",
+            round_name="Omgång 5", opponent="Gammalt lag", raw={},
+        ))
+        db.flush()
+
+        # iBIS har flyttat matchen till 14 september 20:00 (konkret fall i
+        # buggrapporten: IFK Haninge).
+        m = make_match_dict(
+            1001, home_team_id=OTHER_ID, away_team_id=TEAM_A_ID,
+            match_datetime="2026-09-14T20:00:00", round_name="Omgång 3",
+        )
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        result = run_sync(db, client)
+
+        assert result.ok is True
+        # Ingen ny match lades till – den befintliga uppdaterades.
+        assert result.matches_added == 0
+
+        match = db.get(Match, 1001)
+        assert match.kickoff == datetime(2026, 9, 14, 20, 0)
+        assert match.round_name == "Omgång 3"
+        assert match.opponent == f"Hemmalag {OTHER_ID}"
+        assert match.raw["MatchDateTime"] == "2026-09-14T20:00:00"
+
+    def test_fardigrapporterad_match_far_rattat_resultat(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        db.add(Match(
+            match_id=1002, team="A", competition_id=100,
+            kickoff=datetime(2026, 8, 1, 19), status="played", raw={
+                "GoalsHomeTeam": 2, "GoalsAwayTeam": 2,
+                "FinalResultCreatedTS": "2026-08-01T21:00:00",
+            },
+        ))
+        db.add(Player(player_id=42, name="Kalle", last_seen=datetime(2026, 8, 1)))
+        db.add(Appearance(match_id=1002, player_id=42, player_name="Kalle"))
+        db.flush()
+
+        # Sekretariatet rättar 2-2 till 3-2 i efterhand.
+        m = make_match_dict(
+            1002, match_datetime="2026-08-01T19:00:00",
+            goals_home=3, goals_away=2,
+            final_result_ts="2026-08-01T21:00:00",
+        )
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        assert run_sync(db, client).ok is True
+
+        match = db.get(Match, 1002)
+        assert match.raw["GoalsHomeTeam"] == 3
+        # Lineups hämtas inte om för en färdigrapporterad match med appearances…
+        client.fetch_lineups.assert_not_called()
+        # …men matchraden uppdateras ändå.
+
+    def test_skott_finns_kvar_efter_datumandring(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        db.add(Match(
+            match_id=1003, team="A", competition_id=100,
+            kickoff=datetime(2026, 9, 19, 13, 15), status="scheduled", raw={},
+        ))
+        db.add(Player(player_id=7, name="Skytt", last_seen=datetime(2026, 9, 1)))
+        db.add(ShotEvent(
+            id="uuid-1", match_id=1003, player_id=7, side="egen",
+            kind="on_goal", period=1, created_at=datetime(2026, 9, 19, 13, 30),
+        ))
+        db.add(ShotEvent(
+            id="uuid-2", match_id=1003, player_id=None, side="motstandare",
+            kind="missed", period=2, created_at=datetime(2026, 9, 19, 14, 0),
+        ))
+        db.flush()
+
+        m = make_match_dict(1003, home_team_id=TEAM_A_ID, away_team_id=OTHER_ID,
+                            match_datetime="2026-09-14T20:00:00")
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        assert run_sync(db, client).ok is True
+
+        match = db.get(Match, 1003)
+        assert match.kickoff == datetime(2026, 9, 14, 20, 0)
+        shots = db.scalars(
+            select(ShotEvent).where(ShotEvent.match_id == 1003)
+        ).all()
+        assert {s.id for s in shots} == {"uuid-1", "uuid-2"}
+
+    def test_b_match_flyttad_fore_a_match_paverkar_kedjan(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Spelare 42 står i en A-match (10 aug) och en B-match (20 aug). Med den
+        # ordningen spelade han A innan någon B → låst.
+        a_match = _played(100, "2026-08-10T19:00:00",
+                          home_team_id=OTHER_ID, away_team_id=TEAM_A_ID)
+        b_match_late = _played(200, "2026-08-20T19:00:00",
+                               home_team_id=OTHER_ID, away_team_id=TEAM_B_ID)
+        lineups = {
+            100: make_lineups_dict(100, OTHER_ID, TEAM_A_ID,
+                                   away_players=[make_player_dict(42, "Pelle")]),
+            200: make_lineups_dict(200, OTHER_ID, TEAM_B_ID,
+                                   away_players=[make_player_dict(42, "Pelle")]),
+        }
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [a_match]),
+            team_b_dict=make_team_dict(TEAM_B_ID, [b_match_late]),
+            lineups_by_id=lineups,
+        )
+        assert run_sync(db, client).ok is True
+
+        statuses, _ = get_statuses(db)
+        assert statuses[42].locked is True
+
+        # iBIS flyttar B-matchen till 5 augusti – nu ligger den före A-matchen.
+        b_match_early = _played(200, "2026-08-05T19:00:00",
+                                home_team_id=OTHER_ID, away_team_id=TEAM_B_ID)
+        client2 = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [a_match]),
+            team_b_dict=make_team_dict(TEAM_B_ID, [b_match_early]),
+            lineups_by_id=lineups,
+        )
+        assert run_sync(db, client2).ok is True
+
+        assert db.get(Match, 200).kickoff == datetime(2026, 8, 5, 19, 0)
+        statuses2, _ = get_statuses(db)
+        assert statuses2[42].locked is False
+        assert statuses2[42].has_b_appearance is True
+        assert statuses2[42].matches_left == 1
+
+
+# ---------------------------------------------------------------------------
+# Matcher utan satt datum (buggrapport punkt 2)
+# ---------------------------------------------------------------------------
+
+class TestMatchUtanSattDatum:
+    def test_platshallardatum_1_januari_markeras(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = make_match_dict(3001, match_datetime="2026-01-01T00:00:00")
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        assert run_sync(db, client).ok is True
+        assert db.get(Match, 3001).date_missing is True
+
+    def test_match_time_missing_flagga_markeras(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Riktigt utseende på datumet, men MatchTimeMissing är satt.
+        m = make_match_dict(3002, match_datetime="2026-10-01T19:00:00",
+                            match_time_missing=True)
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        assert run_sync(db, client).ok is True
+        assert db.get(Match, 3002).date_missing is True
+
+    def test_riktigt_datum_ger_date_missing_false(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = make_match_dict(3003, match_datetime="2026-09-14T20:00:00")
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
+
+        assert run_sync(db, client).ok is True
+        assert db.get(Match, 3003).date_missing is False
+
+    def test_match_utan_datum_paverkar_aldrig_kedja_eller_lasstatus(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # A-match daterad 1 januari (har passerat) med registrerat resultat och
+        # spelare 42 i truppen, utan någon B-match först. Räknades den skulle
+        # kvalificeringsregeln låsa honom direkt.
+        m = make_match_dict(3100, home_team_id=OTHER_ID, away_team_id=TEAM_A_ID,
+                            match_datetime="2026-01-01T00:00:00",
+                            goals_home=1, goals_away=0,
+                            final_result_ts="2026-01-01T21:00:00")
+        lineups = make_lineups_dict(3100, OTHER_ID, TEAM_A_ID,
+                                    away_players=[make_player_dict(42, "Pelle")])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={3100: lineups},
+        )
+        assert run_sync(db, client).ok is True
+
+        match = db.get(Match, 3100)
+        assert match.date_missing is True
+        statuses, _ = get_statuses(db)
+        assert 42 not in statuses
+
+    def test_match_flyttar_ratt_nar_riktigt_datum_kommer_in(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        # Först utan datum: markeras och hålls utanför regelmotorn.
+        placeholder = make_match_dict(
+            3200, home_team_id=OTHER_ID, away_team_id=TEAM_A_ID,
+            match_datetime="2026-01-01T00:00:00",
+        )
+        lineups = make_lineups_dict(3200, OTHER_ID, TEAM_A_ID,
+                                    away_players=[make_player_dict(42, "Pelle")])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [placeholder]),
+            lineups_by_id={3200: lineups},
+        )
+        assert run_sync(db, client).ok is True
+        assert db.get(Match, 3200).date_missing is True
+        assert 42 not in get_statuses(db)[0]
+
+        # iBIS får ett riktigt datum och matchen spelas.
+        real = make_match_dict(
+            3200, home_team_id=OTHER_ID, away_team_id=TEAM_A_ID,
+            match_datetime="2026-09-14T20:00:00",
+            goals_home=1, goals_away=0,
+            final_result_ts="2026-09-14T21:30:00",
+        )
+        client2 = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [real]),
+            lineups_by_id={3200: lineups},
+        )
+        assert run_sync(db, client2).ok is True
+
+        match = db.get(Match, 3200)
+        assert match.date_missing is False
+        assert match.kickoff == datetime(2026, 9, 14, 20, 0)
+        # Nu räknas matchen: spelare 42 spelade A utan B först → låst.
+        statuses, _ = get_statuses(db)
+        assert statuses[42].locked is True

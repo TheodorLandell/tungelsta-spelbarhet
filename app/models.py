@@ -21,6 +21,12 @@ class Match(Base):
     counts_for_rules: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="1"
     )
+    # True när iBIS ännu inte satt datum/tid (MatchTimeMissing, eller
+    # platshållaren 1 januari 00:00). Går aldrig in i regelmotorn – oavsett
+    # kickoff – och visas sist i matchlistan med "Datum ej satt".
+    date_missing: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0"
+    )
     raw: Mapped[dict] = mapped_column(JSON)
 
     appearances: Mapped[list["Appearance"]] = relationship(back_populates="match")

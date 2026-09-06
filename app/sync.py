@@ -20,6 +20,7 @@ from app.ibis_client import (
     IBISSquadPlayer,
     IBISTeam,
     get_team_players,
+    is_date_missing,
     is_goalkeeper_player,
     is_played,
     parse_kickoff,
@@ -73,6 +74,8 @@ def _upsert_match(
     existing = db.get(Match, m.MatchID)
     status = _match_status(m)
     kickoff = parse_kickoff(m.MatchDateTime).replace(tzinfo=None)
+    opponent = _opponent(m, team_id)
+    date_missing = is_date_missing(m)
 
     if existing is None:
         match = Match(
@@ -82,15 +85,26 @@ def _upsert_match(
             kickoff=kickoff,
             status=status,
             round_name=m.RoundName,
-            opponent=_opponent(m, team_id),
+            opponent=opponent,
             counts_for_rules=counts_for_rules,
+            date_missing=date_missing,
             raw=raw,
         )
         db.add(match)
         return match, True
 
+    # Befintlig match: håll matchdatan färsk (SPEC punkt 1). En flyttad eller
+    # ändrad match ska uppdateras även när lineups hoppas över – skippvillkoren
+    # längre ned i _sync_one_match gäller bara lineups, inte matchraden.
+    #   kickoff (MatchDateTime), status, resultat (raw), motståndare, hall (raw)
+    #   och omgång hålls färska. Gäller alla matcher, även färdigrapporterade –
+    #   ett resultat kan rättas i efterhand.
+    existing.kickoff = kickoff
     existing.status = status
+    existing.round_name = m.RoundName
+    existing.opponent = opponent
     existing.counts_for_rules = counts_for_rules
+    existing.date_missing = date_missing
     existing.raw = raw
     return existing, False
 

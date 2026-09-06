@@ -31,17 +31,21 @@ def get_statuses(
     """
     Läser matcher och appearances ur databasen och kör regelmotorn.
 
-    Endast matcher med counts_for_rules == True skickas in. Cup- och
-    träningsmatcher (och deras appearances) filtreras bort helt – de får aldrig
-    påverka kvalificeringsregeln eller kedjeregeln. Detsamma gäller en
-    roster_edit på en sådan match: den matchen finns inte i counting_ids och
-    kan därför inte påverka reglerna.
+    Endast matcher med counts_for_rules == True och date_missing == False
+    skickas in. Cup- och träningsmatcher (och deras appearances) filtreras bort
+    helt – de får aldrig påverka kvalificeringsregeln eller kedjeregeln.
+    Detsamma gäller en match utan satt datum (SPEC punkt 2): den skickas aldrig
+    in, oavsett kickoff. En roster_edit på en sådan match finns inte i
+    counting_ids och kan därför inte heller påverka reglerna.
 
     apply_edits=False kör motorn på enbart iBIS-datan, utan roster_edits. Används
     för att avgöra vilka spelare en roster_edit faktiskt påverkat.
     """
     orm_matches = db.scalars(
-        select(OrmMatch).where(OrmMatch.counts_for_rules.is_(True))
+        select(OrmMatch).where(
+            OrmMatch.counts_for_rules.is_(True),
+            OrmMatch.date_missing.is_(False),
+        )
     ).all()
     counting_ids = {m.match_id for m in orm_matches}
     orm_appearances = [

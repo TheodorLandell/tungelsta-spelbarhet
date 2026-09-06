@@ -108,8 +108,13 @@ class IBISMatch(BaseModel):
     Round: int | None = None
     RoundName: str | None = None
     MatchStatus: int | None = None
+    # iBIS sätter detta när datum/tid ännu inte bestämts. Saknas fältet är
+    # platshållaren MatchDateTime "1 januari 00:00" (se is_date_missing).
+    MatchTimeMissing: bool = False
 
-    @field_validator("Cancelled", "Postponed", "Abandoned", mode="before")
+    @field_validator(
+        "Cancelled", "Postponed", "Abandoned", "MatchTimeMissing", mode="before"
+    )
     @classmethod
     def coerce_bool(cls, v: Any) -> bool:
         if isinstance(v, bool):
@@ -197,6 +202,28 @@ def is_played(match: IBISMatch) -> bool:
     kickoff = parse_kickoff(match.MatchDateTime)
     now = datetime.now(tz=STOCKHOLM)
     return kickoff < now and match.GoalsHomeTeam is not None
+
+
+# iBIS platshållare för en match där datum och tid ännu inte bestämts:
+# MatchDateTime blir "1 januari 00:00". (månad, dag, timme, minut, sekund)
+_PLACEHOLDER_KICKOFF = (1, 1, 0, 0, 0)
+
+
+def is_date_missing(match: IBISMatch) -> bool:
+    """
+    True för en match där iBIS ännu inte satt ett riktigt datum.
+
+    Använd MatchTimeMissing om fältet är satt, annars platshållaren där
+    MatchDateTime är "1 januari 00:00". En sådan match får aldrig gå in i
+    regelmotorn (oavsett kickoff) och visas sist i matchlistan.
+    """
+    if match.MatchTimeMissing:
+        return True
+    try:
+        k = parse_kickoff(match.MatchDateTime)
+    except ValueError:
+        return False
+    return (k.month, k.day, k.hour, k.minute, k.second) == _PLACEHOLDER_KICKOFF
 
 
 def filter_series_competitions(team: IBISTeam) -> list[IBISCompetition]:
