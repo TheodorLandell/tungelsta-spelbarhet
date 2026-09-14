@@ -139,6 +139,10 @@ class ShotEvent(Base):
     side skiljer det egna laget från motståndaren. Motståndarens skott
     registreras bara på lagnivå (SPEC 6.1), så player_id är null för
     side == 'motstandare' och satt för side == 'egen'.
+
+    goalkeeper_id är spegelvänt: satt för motståndarens skott och null för våra
+    egna. Det är den målvakt som var vald när trycket gjordes, och är därmed
+    den enda källan till vem som stod i mål vid ett givet skott (SPEC 6.8).
     """
 
     __tablename__ = "shot_events"
@@ -148,6 +152,9 @@ class ShotEvent(Base):
         Integer, ForeignKey("matches.match_id"), index=True
     )
     player_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("players.player_id"), nullable=True
+    )
+    goalkeeper_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("players.player_id"), nullable=True
     )
     side: Mapped[str] = mapped_column(          # 'egen' | 'motstandare'

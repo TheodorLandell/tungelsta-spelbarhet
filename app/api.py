@@ -60,7 +60,7 @@ from app.models import (
     ShotEvent,
     SyncLog,
 )
-from app.periods import split_by_period, team_periods_from_raw
+from app.periods import match_goal_split, split_by_period, team_periods_from_raw
 from app.stats import SCOPES, compute_stats
 from app.status import get_statuses
 from app.sync import _match_status, _now_naive, run_sync
@@ -638,19 +638,13 @@ def _team_period_split(
     if total is None:
         return None, 0
 
-    raw = m.raw or {}
-    home_id = raw.get("HomeTeamID")
-    if home_id is None:
-        return None, total
-
-    vi_ar_hemma = home_id == _team_id_for(m.team)
-    hemma_sida = vi_ar_hemma if egen else not vi_ar_hemma
-
-    perioder = team_periods_from_raw(raw, hemma=hemma_sida)
+    perioder, _total, utan = match_goal_split(
+        m.raw or {}, _team_id_for(m.team), egen=egen
+    )
     if perioder is None:
         # Inga periodsiffror: målen räknas bara i "hela matchen".
         return None, total
-    return split_by_period(total, perioder)
+    return perioder, utan
 
 
 def _period_breakdown(db: Session, match_id: int) -> tuple[dict, dict]:
@@ -1163,6 +1157,10 @@ class ShotEventIn(BaseModel):
     id: str
     # null för motståndarens skott – de registreras bara på lagnivå (SPEC 6.1)
     player_id: int | None = None
+    # Vald målvakt när trycket gjordes. Bara för motståndarens skott (SPEC 6.8).
+    # Äldre klienter skickar inte fältet – då blir det null och skottet räknas
+    # inte in i någon målvakts statistik.
+    goalkeeper_id: int | None = None
     side: str = "egen"
     kind: str
     period: int
@@ -1188,6 +1186,7 @@ def _shot_event_out(e: ShotEvent) -> dict[str, Any]:
         "id": e.id,
         "match_id": e.match_id,
         "player_id": e.player_id,
+        "goalkeeper_id": e.goalkeeper_id,
         "side": e.side,
         "kind": e.kind,
         "period": e.period,
@@ -1239,6 +1238,9 @@ def post_shot_events(
         if h.side == "egen" and h.player_id is None:
             raise HTTPException(status_code=422, detail="Eget skott saknar player_id")
         player_id = h.player_id if h.side == "egen" else None
+        # Målvakt hör bara till motståndarens skott (SPEC 6.8). På ett eget
+        # skott är fältet meningslöst och nollas.
+        goalkeeper_id = h.goalkeeper_id if h.side == "motstandare" else None
 
         deleted_at = _parse_client_ts(h.deleted_at) if h.deleted_at else None
         existing = db.get(ShotEvent, h.id)
@@ -1247,6 +1249,7 @@ def post_shot_events(
                 id=h.id,
                 match_id=match_id,
                 player_id=player_id,
+                goalkeeper_id=goalkeeper_id,
                 side=h.side,
                 kind=h.kind,
                 period=h.period,

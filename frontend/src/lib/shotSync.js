@@ -35,6 +35,7 @@ function toWire(e) {
   return {
     id: e.id,
     player_id: e.player_id ?? null,
+    goalkeeper_id: e.goalkeeper_id ?? null,
     side: e.side ?? 'egen',
     kind: e.kind,
     period: e.period,

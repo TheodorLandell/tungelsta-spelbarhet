@@ -33,7 +33,10 @@ registrerade.
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.goalkeeper import attribute_conceded, save_stats
 from app.models import Appearance, Match, Player, ShotEvent
+from app.periods import match_goal_split
 from app.roster import apply_roster_edits, roster_edits_for_matches
 
 SCOPES = ("senaste", "senaste_n", "sasong")
@@ -71,6 +74,76 @@ def _shares(parts: list[int], total: int) -> list[int | None]:
     for i in order[:left]:
         floors[i] += 1
     return floors
+
+
+def _goalkeeper_totals(
+    db: Session, team: str, scoped_set: set[int], matches: list[Match]
+) -> dict:
+    """
+    Summerar målvaktssiffror över omfattningen.
+
+    Returnerar ``{"registrerade": {gk: skott på mål mot}, "inslappta": {gk: mål},
+    "sedda": set, "approximativ": bool, "oattribuerat": int}``. ``sedda`` är de
+    målvakter som faktiskt har registrerade motståndarskott – bara de får
+    siffror, resten visas tomma (SPEC 6.8).
+    """
+    registrerade: dict[int, int] = {}
+    inslappta: dict[int, int] = {}
+    sedda: set[int] = set()
+    approximativ = False
+    oattribuerat = 0
+
+    if not scoped_set:
+        return {
+            "registrerade": registrerade, "inslappta": inslappta,
+            "sedda": sedda, "approximativ": approximativ,
+            "oattribuerat": oattribuerat,
+        }
+
+    # match_id -> period -> goalkeeper_id -> antal motståndarskott
+    per_match: dict[int, dict[int, dict[int, int]]] = {}
+    for e in db.scalars(
+        select(ShotEvent).where(
+            ShotEvent.match_id.in_(scoped_set),
+            ShotEvent.deleted_at.is_(None),
+            ShotEvent.side == "motstandare",
+        )
+    ).all():
+        # Skott registrerade innan målvaktsvalet fanns saknar målvakt och
+        # räknas inte in någonstans – hellre saknad siffra än gissad.
+        if e.goalkeeper_id is None:
+            continue
+        sedda.add(e.goalkeeper_id)
+        bucket = per_match.setdefault(e.match_id, {}).setdefault(e.period, {})
+        bucket[e.goalkeeper_id] = bucket.get(e.goalkeeper_id, 0) + 1
+        if e.kind == "on_goal":
+            registrerade[e.goalkeeper_id] = registrerade.get(e.goalkeeper_id, 0) + 1
+
+    team_id = settings.team_a_id if team == "A" else settings.team_b_id
+
+    for m in matches:
+        if m.match_id not in scoped_set:
+            continue
+        events_by_period = per_match.get(m.match_id)
+        if not events_by_period:
+            continue
+
+        perioder, _total, utan = match_goal_split(
+            m.raw or {}, team_id, egen=False
+        )
+        per_gk, oattr, approx = attribute_conceded(
+            events_by_period, perioder or {}, utan
+        )
+        for gk_id, mal in per_gk.items():
+            inslappta[gk_id] = inslappta.get(gk_id, 0) + mal
+        oattribuerat += oattr
+        approximativ = approximativ or approx
+
+    return {
+        "registrerade": registrerade, "inslappta": inslappta,
+        "sedda": sedda, "approximativ": approximativ,
+        "oattribuerat": oattribuerat,
+    }
 
 
 def compute_stats(db: Session, team: str, scope: str, n: int = 5) -> dict:
@@ -122,6 +195,11 @@ def compute_stats(db: Session, team: str, scope: str, n: int = 5) -> dict:
         registered_matches.add(e.match_id)
         bucket = shots.setdefault((e.match_id, e.player_id), {})
         bucket[e.kind] = bucket.get(e.kind, 0) + 1
+
+    # Målvaktsstatistik (SPEC 6.8). Motståndarens skott bär själva vilken
+    # målvakt som stod, medan insläppta mål bara har period och därför
+    # tilldelas per period.
+    gk = _goalkeeper_totals(db, team, scoped_set, matches)
 
     matches_by_player: dict[int, list[int]] = {}
     for (m, p) in squad:
@@ -176,17 +254,37 @@ def compute_stats(db: Session, team: str, scope: str, n: int = 5) -> dict:
         else:
             skott = {"registrerat": False}
 
+        ar_malvakt = bool(p.is_goalkeeper) if p else False
+
+        # Målvakter mäts på motståndarens skott, inte på sina egna (SPEC 6.8).
+        # Utan registrerade motståndarskott visas tomt, aldrig noll.
+        if not ar_malvakt:
+            malvaktsstatistik = None
+        elif pid in gk["sedda"]:
+            malvaktsstatistik = {
+                "registrerat": True,
+                **save_stats(
+                    gk["registrerade"].get(pid, 0), gk["inslappta"].get(pid, 0)
+                ),
+                # Byttes målvakt mitt i en period bygger insläppta mål på vem
+                # som mötte flest skott. Det ska framgå i UI.
+                "approximativ": gk["approximativ"],
+            }
+        else:
+            malvaktsstatistik = {"registrerat": False}
+
         rader.append({
             "player_id": pid,
             "namn": p.name if p else player_names.get(pid, f"Spelare {pid}"),
             "trojnummer": p.shirt_no if p else None,
-            "malvakt": bool(p.is_goalkeeper) if p else False,
+            "malvakt": ar_malvakt,
             "matcher": len(mids),
             "mal": mal,
             "assist": assist,
             "poang": mal + assist,
             "utvisningsminuter": utv,
             "skott": skott,
+            "malvaktsstatistik": malvaktsstatistik,
         })
 
     rader.sort(key=lambda r: (-r["poang"], -r["mal"], r["namn"] or ""))

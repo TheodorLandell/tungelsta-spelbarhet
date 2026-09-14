@@ -67,6 +67,36 @@ def goals_for_scope(perioder: dict[int, int] | None, total: int | None, period) 
     return perioder.get(period, perioder.get(str(period), 0))
 
 
+def match_goal_split(
+    raw: dict, our_team_id: int, *, egen: bool
+) -> tuple[dict[int, int] | None, int | None, int]:
+    """
+    Ett lags mål i en match: ``(perioder, total, utan_period)``.
+
+    ``egen=True`` ger vårt lag, ``egen=False`` motståndaren. Vilken sida i
+    matchobjektet som är vår avgörs av om vi spelar hemma. Saknas resultatet
+    eller hemmalaget returneras ``(None, None, 0)`` – matchen har inga kända
+    mål att fördela.
+    """
+    home_id = raw.get("HomeTeamID")
+    if home_id is None:
+        return None, None, 0
+
+    vi_ar_hemma = home_id == our_team_id
+    hemma_sida = vi_ar_hemma if egen else not vi_ar_hemma
+
+    total = raw.get("GoalsHomeTeam" if hemma_sida else "GoalsAwayTeam")
+    if not isinstance(total, int):
+        return None, None, 0
+
+    perioder = team_periods_from_raw(raw, hemma=hemma_sida)
+    if perioder is None:
+        return None, total, total
+
+    fordelade, utan = split_by_period(total, perioder)
+    return fordelade, total, utan
+
+
 def team_periods_from_raw(raw: dict, *, hemma: bool) -> dict[int, int] | None:
     """
     Lagets mål per period ur ``IntermediateResults``.

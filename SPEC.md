@@ -202,6 +202,8 @@ shot_events
   id                PK, UUID skapad på klienten
   match_id          FK
   player_id         FK, null för motståndarens skott
+  goalkeeper_id     FK, vald målvakt när trycket gjordes. Spegelvänt mot
+                    player_id: satt för motståndarens skott, null för egna (6.8)
   side              'egen' | 'motstandare'
   kind              'on_goal' | 'missed' | 'blocked'
   period            1 | 2 | 3
@@ -344,7 +346,9 @@ lagring och synk som spelarnas. På `shot_events` bär raderna
 trycks medan P2 är valt sparas som period 2. Vald period ska synas tydligt, och
 appen bör påminna vid periodbyte eftersom det annars är lätt att glömma.
 
-**Målvakter** visas i listan som alla andra, markerade med MV.
+**Målvakter** står i samma lista, markerade med MV, men har ett eget kort utan
+plus- och minusknappar. De mäts på motståndarens skott i stället för på sina
+egna (6.8).
 
 **Målrutan är tom tills målen finns** eftersom målen kommer från iBIS. I
 matchhuvudet betyder det ett blankt resultat tills något rapporterats; i
@@ -471,6 +475,54 @@ slutresultatet rapporterades. `matches.stats_final_ts` håller vilket
 `FinalResultCreatedTS` som gällde vid den senaste hämtningen; är det null eller
 ett annat värde hämtas matchen om.
 
+### 6.8 Målvakter
+
+En målvakt mäts inte som en utespelare. I stället för på mål, utanför och i täck
+visas fyra tal:
+
+| Värde | Räknas som |
+|-------|------------|
+| Skott på mål mot | Registrerade motståndarskott på mål **plus** insläppta mål |
+| Insläppta mål | Motståndarens mål, tilldelade via perioden |
+| Räddningar | Skott på mål mot minus insläppta |
+| Räddningsprocent | Räddningar delat med skott på mål mot |
+
+Att målen ingår i skott på mål mot följer samma modell som för utespelarna
+(6.2): ett mål *är* ett skott på mål. Tränarna registrerar aldrig mål manuellt,
+så utan dem skulle målen saknas helt i målvaktens siffror – och räddningar, som
+är differensen, kunde bli negativa. Med målen inräknade är räddningar exakt de
+registrerade skotten på mål, vilket också är vad en räddning faktiskt är.
+
+Gäller både matchvyn och statistiksidan, och följer vald period som allt annat.
+**Finns inga registrerade motståndarskott visas tomt, inte noll.**
+
+**Val av målvakt.** Står minst en målvakt i matchens trupp kan tränaren välja vem
+som står. Väljaren sitter vid motståndarens skottblock, eftersom det är de
+skotten den styr.
+
+- Står bara en målvakt i truppen är han förvald
+- Står två eller fler väljs en, och valet kan ändras när som helst under matchen
+- Byte kräver två tryck – först "Byt", sedan vem – så att valet inte går att
+  råka ändra mitt i en registrering
+- Valet sparas lokalt per match. Öppnas matchen på en annan enhet utan eget val
+  väljs den målvakt som de senast registrerade motståndarskotten tillskrivits,
+  så två tränare hamnar på samma
+
+**Attribuering, två precisioner.** Skotten vet själva vem som stod:
+`shot_events.goalkeeper_id` sätts från valet när trycket görs och skrivs aldrig
+om. Ett målvaktsbyte påverkar bara kommande tryck.
+
+Insläppta mål kommer från iBIS och har bara period, inte målvakt. En periods mål
+tilldelas därför den målvakt som mötte flest skott i perioden. **Byts målvakt
+mitt i en period blir det en approximation.** Det är acceptabelt, men ska framgå
+i gränssnittet – kortet säger att målen fördelats efter vem som mötte flest
+skott.
+
+Mål i en period utan registrerade motståndarskott, och mål utan period (6.7),
+tillskrivs ingen målvakt alls. Samma regel som för övrigt: hellre en saknad
+siffra än en felaktig. Motståndarskott registrerade innan målvaktsvalet fanns har
+`goalkeeper_id = null` och räknas inte in i någon målvakts statistik.
+
 ---
 
 ## 7. Del 3 – Statistik
@@ -496,6 +548,10 @@ post ovanpå.
 
 **De tre andelarna** – på mål, utanför, i täck – summerar till 100 %. Mål är
 ingen fjärde andel utan visas som eget värde tillsammans med målprocenten.
+
+**Målvakter** får i stället skott på mål mot, insläppta, räddningar och
+räddningsprocent (6.8). De visar aldrig på mål, utanför och i täck som
+utespelarna. Saknas registrerade motståndarskott i omfattningen visas tomt.
 
 **Urval.** Överst sitter lagväljaren A/B – samma väljare som i matchlistan, och
 en av de två vyer där den visas – och omfattningsvalet: senaste matchen, de
@@ -547,7 +603,7 @@ Mobilen är den primära enheten genomgående. Bygg mobile-first.
 - Cup- och träningsmatcher
 - Val av säsong i gränssnittet
 - Användarkonton, roller, notifieringar
-- Målvaktsstatistik utöver mål, assist och utvisningar
+- Motståndarnas målvakt (vi mäter bara vår egen, se 6.8)
 
 ---
 

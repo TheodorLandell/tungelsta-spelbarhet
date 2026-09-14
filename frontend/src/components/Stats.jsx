@@ -123,6 +123,47 @@ function Skottfordelning({ skott }) {
 }
 
 // ---------------------------------------------------------------------------
+// Målvaktsstatistik (SPEC 6.8)
+//
+// Målvakter mäts på motståndarens skott, inte på sina egna. Utan registrerade
+// motståndarskott visas tomt, aldrig noll.
+// ---------------------------------------------------------------------------
+
+function Malvaktsstatistik({ statistik }) {
+  if (!statistik || !statistik.registrerat) {
+    return (
+      <p className="mt-2 text-xs text-gray-400">
+        Målvakt: inga registrerade motståndarskott i den här omfattningen
+      </p>
+    )
+  }
+
+  return (
+    <div className="mt-2">
+      <div className="grid grid-cols-4 gap-2 rounded-xl bg-gray-50 py-2">
+        <Nyckeltal label="På mål mot" value={statistik.skott_pa_mal_mot} />
+        <Nyckeltal label="Insläppta" value={statistik.inslappta} />
+        <Nyckeltal label="Räddningar" value={statistik.raddningar} />
+        <Nyckeltal
+          label="Räddn. %"
+          value={
+            statistik.raddningsprocent == null
+              ? '–'
+              : `${statistik.raddningsprocent}`
+          }
+        />
+      </div>
+      {statistik.approximativ && (
+        <p className="mt-1.5 text-xs text-gray-500">
+          Målvakten byttes under en period, så insläppta mål är fördelade efter
+          vem som mötte flest skott.
+        </p>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // En spelare
 // ---------------------------------------------------------------------------
 
@@ -167,7 +208,11 @@ function SpelarKort({ spelare }) {
         <Nyckeltal label="Utv. min" value={spelare.utvisningsminuter} />
       </div>
 
-      <Skottfordelning skott={spelare.skott} />
+      {spelare.malvakt ? (
+        <Malvaktsstatistik statistik={spelare.malvaktsstatistik} />
+      ) : (
+        <Skottfordelning skott={spelare.skott} />
+      )}
     </div>
   )
 }

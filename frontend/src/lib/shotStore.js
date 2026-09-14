@@ -93,6 +93,10 @@ export async function loadEvents(matchId) {
 
 // side: 'egen' (skott för en av våra spelare) eller 'motstandare' (skott på
 // lagnivå för motståndarlaget, SPEC 6.1). För 'motstandare' är playerId null.
+//
+// goalkeeperId är den målvakt som är vald när trycket görs och sätts bara på
+// motståndarens skott (SPEC 6.8). Attribueringen låses i händelsen, så ett
+// senare målvaktsbyte ändrar aldrig skott som redan registrerats.
 export async function addEvent({
   matchId,
   playerId,
@@ -100,13 +104,16 @@ export async function addEvent({
   period,
   createdBy,
   side = 'egen',
+  goalkeeperId = null,
 }) {
   if (!KINDS.includes(kind)) throw new Error(`Okänd kategori: ${kind}`)
+  const motstandare = side === 'motstandare'
   const now = new Date().toISOString()
   const event = {
     id: newId(),
     match_id: matchId,
-    player_id: side === 'motstandare' ? null : playerId,
+    player_id: motstandare ? null : playerId,
+    goalkeeper_id: motstandare ? goalkeeperId ?? null : null,
     side,
     kind,
     period,
@@ -275,6 +282,7 @@ export function reconcileRemote(local, remote, stamp = new Date().toISOString())
         id: r.id,
         match_id: r.match_id,
         player_id: r.player_id ?? null,
+        goalkeeper_id: r.goalkeeper_id ?? null,
         side: r.side ?? 'egen',
         kind: r.kind,
         period: Number(r.period),

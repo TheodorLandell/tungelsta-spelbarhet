@@ -14,12 +14,63 @@ import {
 import { syncMatch, SyncError } from '../lib/shotSync'
 import { matchesPlayerQuery } from '../lib/search'
 import { malTal, motstandareMalTal, shotModel } from '../lib/periods'
+import { goalkeepersInSquad, goalkeeperStats } from '../lib/goalkeeper'
 import MatchHeader from './MatchHeader'
 import PlayerSearch from './PlayerSearch'
 
 const PERIODS = [1, 2, 3]
 const NAME_KEY = 'tranare_kortnamn'
 const SYNC_INTERVAL_MS = 20000
+
+// Vald målvakt sparas per match, så den överlever omladdning och offline.
+// Själva attribueringen ligger i händelserna, inte här – det här är bara vilken
+// målvakt nästa tryck ska tillskrivas (SPEC 6.8).
+const GK_KEY = matchId => `malvakt_match_${matchId}`
+
+function loadGoalkeeper(matchId) {
+  try {
+    const v = localStorage.getItem(GK_KEY(matchId))
+    return v ? Number(v) : null
+  } catch {
+    return null
+  }
+}
+
+function saveGoalkeeper(matchId, gkId) {
+  try {
+    if (gkId == null) localStorage.removeItem(GK_KEY(matchId))
+    else localStorage.setItem(GK_KEY(matchId), String(gkId))
+  } catch {
+    // localStorage blockerad – valet gäller ändå denna session
+  }
+}
+
+// Vilken målvakt som ska vara vald när vyn öppnas:
+//   1. det som sparats lokalt för matchen
+//   2. den målvakt som senast registrerade motståndarskott tillskrevs – så en
+//      andra tränares enhet hamnar på samma målvakt som redan används
+//   3. enda målvakten i truppen, om det bara finns en
+function initialGoalkeeper(matchId, malvakter, events) {
+  const ids = malvakter.map(p => p.player_id)
+  if (!ids.length) return null
+
+  const sparad = loadGoalkeeper(matchId)
+  if (sparad != null && ids.includes(sparad)) return sparad
+
+  const senaste = (events ?? [])
+    .filter(
+      e =>
+        !e.deleted_at &&
+        (e.side || 'egen') === 'motstandare' &&
+        e.goalkeeper_id != null &&
+        ids.includes(e.goalkeeper_id),
+    )
+    .sort((a, b) => a.created_at.localeCompare(b.created_at))
+    .pop()
+  if (senaste) return senaste.goalkeeper_id
+
+  return ids.length === 1 ? ids[0] : null
+}
 
 function isOnline() {
   return typeof navigator === 'undefined' ? true : navigator.onLine !== false
@@ -124,6 +175,167 @@ function CategoryControl({ kind, count, onPlus, onMinus, disabled, readOnly }) {
       >
         −
       </button>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Målvaktsväljare (SPEC 6.8)
+//
+// Sitter vid motståndarens skottblock, eftersom det är de skotten den styr.
+// Med bara en målvakt i truppen är han förvald och det finns inget att byta.
+// Med flera krävs två tryck för att byta – först "Byt", sedan vem. Det gör
+// valet tydligt utan att det går att råka ändra mitt i en registrering.
+// ---------------------------------------------------------------------------
+
+function GoalkeeperPicker({ malvakter, vald, onChange, disabled }) {
+  const [oppen, setOppen] = useState(false)
+
+  if (!malvakter.length) return null
+
+  const valdSpelare = malvakter.find(p => p.player_id === vald)
+  const flera = malvakter.length > 1
+
+  return (
+    <div className="mt-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] font-bold uppercase tracking-wide
+                         text-white bg-black rounded px-1.5 py-0.5 shrink-0">
+          MV
+        </span>
+        <span className="flex-1 min-w-0 text-sm text-gray-900 truncate">
+          {valdSpelare ? (
+            <>
+              <span className="text-gray-500">I mål: </span>
+              <span className="font-semibold">{valdSpelare.namn}</span>
+            </>
+          ) : (
+            <span className="text-gray-500">Ingen målvakt vald</span>
+          )}
+        </span>
+        {flera && (
+          <button
+            onClick={() => setOppen(o => !o)}
+            aria-expanded={oppen}
+            className="shrink-0 rounded-lg border border-gray-300 bg-white px-3 py-1
+                       text-xs font-semibold text-gray-600 hover:bg-gray-100
+                       select-none touch-manipulation transition-colors"
+          >
+            {oppen ? 'Avbryt' : 'Byt'}
+          </button>
+        )}
+      </div>
+
+      {oppen && (
+        <div className="mt-2 space-y-1">
+          {malvakter.map(p => (
+            <button
+              key={p.player_id}
+              onClick={() => {
+                onChange(p.player_id)
+                setOppen(false)
+              }}
+              disabled={disabled}
+              aria-pressed={p.player_id === vald}
+              className={`w-full rounded-lg px-3 py-2.5 text-sm font-semibold text-left
+                          select-none touch-manipulation border transition
+                          disabled:opacity-40 ${
+                            p.player_id === vald
+                              ? 'bg-tuif-orange text-black border-transparent'
+                              : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-100'
+                          }`}
+            >
+              {p.trojnummer != null && (
+                <span className="text-gray-400 tabular-nums mr-2">
+                  {p.trojnummer}
+                </span>
+              )}
+              {p.namn}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {!valdSpelare && flera && (
+        <p className="mt-1.5 text-xs text-gray-500">
+          Välj vem som står innan du registrerar motståndarens skott.
+        </p>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Ett målvaktskort (SPEC 6.8)
+//
+// Målvakter visar inte på mål, utanför och i täck som utespelarna. De mäts på
+// motståndarens skott: skott på mål mot, insläppta, räddningar och
+// räddningsprocent.
+// ---------------------------------------------------------------------------
+
+function GoalkeeperStat({ label, value }) {
+  return (
+    <div className="text-center">
+      <div className="text-lg font-bold tabular-nums text-gray-900 leading-none">
+        {value}
+      </div>
+      <div className="text-[11px] text-gray-500 mt-1 leading-tight">{label}</div>
+    </div>
+  )
+}
+
+function GoalkeeperCard({ player, stats, iMal, overview }) {
+  return (
+    <div className={`px-3 py-3 ${overview ? 'bg-gray-50' : ''}`}>
+      <div className="flex items-center gap-2 mb-2">
+        <span className="w-7 shrink-0 text-right text-sm text-gray-400 tabular-nums select-none">
+          {player.trojnummer != null ? player.trojnummer : ''}
+        </span>
+        <span className="flex-1 min-w-0 text-sm font-medium text-gray-900 truncate">
+          {player.namn}
+          <span
+            className="ml-2 text-[10px] font-bold uppercase tracking-wide
+                       text-white bg-black rounded px-1.5 py-0.5 align-middle"
+          >
+            MV
+          </span>
+          {iMal && (
+            <span
+              className="ml-1.5 text-[10px] font-bold uppercase tracking-wide
+                         text-black bg-tuif-orange rounded px-1.5 py-0.5 align-middle"
+            >
+              I mål
+            </span>
+          )}
+        </span>
+      </div>
+
+      {stats.registrerat ? (
+        <>
+          <div className="grid grid-cols-4 gap-2 rounded-xl bg-gray-50 py-2">
+            <GoalkeeperStat label="På mål mot" value={stats.skottPaMalMot} />
+            <GoalkeeperStat label="Insläppta" value={stats.inslappta} />
+            <GoalkeeperStat label="Räddningar" value={stats.raddningar} />
+            <GoalkeeperStat
+              label="Räddn. %"
+              value={
+                stats.raddningsprocent == null ? '–' : `${stats.raddningsprocent}`
+              }
+            />
+          </div>
+          {stats.approximativ && (
+            <p className="mt-1.5 text-xs text-gray-500">
+              Målvakten byttes under perioden, så insläppta mål är fördelade
+              efter vem som mötte flest skott.
+            </p>
+          )}
+        </>
+      ) : (
+        // Inga registrerade motståndarskott: tomt, inte nollor (SPEC 6.8).
+        <p className="text-xs text-gray-400">
+          Inga registrerade motståndarskott i den här vyn
+        </p>
+      )}
     </div>
   )
 }
@@ -281,8 +493,11 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
   const matchId = match.match_id
   const trupp = match.trupp ?? []
 
+  const malvakter = goalkeepersInSquad(trupp)
+
   const [events, setEvents] = useState(null)
   const [period, setPeriod] = useState(1)
+  const [goalkeeperId, setGoalkeeperId] = useState(null)
   const [sok, setSok] = useState('')
   const [name, setName] = useState(loadName)
   const [loadError, setLoadError] = useState(false)
@@ -302,6 +517,9 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
       .then(rows => {
         if (alive) {
           setEvents(rows)
+          // Målvakten väljs utifrån det som redan registrerats, så två
+          // tränares enheter hamnar på samma (SPEC 6.8).
+          setGoalkeeperId(initialGoalkeeper(matchId, malvakter, rows))
           eventsReadyRef.current = true
           runSyncRef.current() // första synken direkt när händelserna finns
         }
@@ -426,8 +644,19 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
     [matchId, period, runSync],
   )
 
+  // Målvaktsbyte. Påverkar bara kommande tryck – redan registrerade skott bär
+  // sin målvakt i händelsen och skrivs aldrig om (SPEC 6.8).
+  const changeGoalkeeper = useCallback(
+    gkId => {
+      setGoalkeeperId(gkId)
+      saveGoalkeeper(matchId, gkId)
+    },
+    [matchId],
+  )
+
   // Motståndarens skott – bara på lagnivå, ingen spelare (SPEC 6.1). Samma
-  // periodtaggning, samma local-first lagring och synk som spelarnas.
+  // periodtaggning, samma local-first lagring och synk som spelarnas. Skottet
+  // tillskrivs den målvakt som är vald just nu.
   const handleOpponentPlus = useCallback(
     async kind => {
       if (!canRegisterInPeriod(period)) return
@@ -439,6 +668,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
           period,
           createdBy: name,
           side: 'motstandare',
+          goalkeeperId,
         })
         setEvents(prev => [...(prev ?? []), ev])
         runSync()
@@ -446,7 +676,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
         setLoadError(true)
       }
     },
-    [matchId, period, name, runSync],
+    [matchId, period, name, goalkeeperId, runSync],
   )
 
   const handleOpponentMinus = useCallback(
@@ -645,6 +875,15 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
               />
             ))}
           </div>
+
+          {/* Målvaktsväljaren hör till motståndarens skott – det är dem den
+              styr attribueringen av (SPEC 6.8). */}
+          <GoalkeeperPicker
+            malvakter={malvakter}
+            vald={goalkeeperId}
+            onChange={changeGoalkeeper}
+            disabled={overview}
+          />
         </div>
       </div>
 
@@ -664,19 +903,31 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
             Ingen spelare matchar sökningen.
           </p>
         ) : (
-          filteredTrupp.map(p => (
-            <PlayerCard
-              key={p.player_id}
-              player={p}
-              counts={counts}
-              totalCounts={totalCounts}
-              period={period}
-              onPlus={handlePlus}
-              onMinus={handleMinus}
-              disabled={!name}
-              overview={overview}
-            />
-          ))
+          filteredTrupp.map(p =>
+            // Målvakter mäts på motståndarens skott, inte på sina egna, och
+            // får därför ett eget kort utan plus- och minusknappar (SPEC 6.8).
+            p.malvakt ? (
+              <GoalkeeperCard
+                key={p.player_id}
+                player={p}
+                stats={goalkeeperStats(events, match, p.player_id, period)}
+                iMal={p.player_id === goalkeeperId}
+                overview={overview}
+              />
+            ) : (
+              <PlayerCard
+                key={p.player_id}
+                player={p}
+                counts={counts}
+                totalCounts={totalCounts}
+                period={period}
+                onPlus={handlePlus}
+                onMinus={handleMinus}
+                disabled={!name}
+                overview={overview}
+              />
+            ),
+          )
         )}
       </div>
     </div>
