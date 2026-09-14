@@ -137,3 +137,54 @@ test('shotModel: saknade skott tolkas som noll', () => {
   assert.equal(m.paMal, 1)
   assert.equal(m.totalt, 1)
 })
+
+// ---------------------------------------------------------------------------
+// Matchvyn med verklig data: IFK Haninge (C) - Tungelsta IF (B) 6-8
+//
+// Samma modell som statistiksidan ska gälla i matchhuvudet och på
+// spelarkorten: målen ingår i på mål och räknas aldrig separat i totalen.
+// ---------------------------------------------------------------------------
+
+const MATCH_1723835 = [
+  { namn: 'Johnny Andersson', mal: 2, skott: { on_goal: 1, missed: 3, blocked: 4 } },
+  { namn: 'William Lindahl', mal: 3, skott: { on_goal: 2, missed: 1, blocked: 1 } },
+  { namn: 'Adam Burgren', mal: 1, skott: { on_goal: 4, missed: 2, blocked: 0 } },
+  { namn: 'Felix Wikström', mal: 1, skott: { on_goal: 0, missed: 1, blocked: 2 } },
+  { namn: 'Tim Johannesson', mal: 1, skott: { on_goal: 3, missed: 0, blocked: 1 } },
+]
+
+test('matchvyn: varje spelares på mål inkluderar hans mål', () => {
+  for (const { namn, mal, skott } of MATCH_1723835) {
+    const m = shotModel(skott, mal)
+    assert.equal(m.paMal, skott.on_goal + mal, namn)
+    assert.ok(m.paMal >= mal, `${namn}: på mål ska minst vara antalet mål`)
+  }
+})
+
+test('matchvyn: totalt = på mål + utanför + i täck, målen dubbelräknas inte', () => {
+  for (const { namn, mal, skott } of MATCH_1723835) {
+    const m = shotModel(skott, mal)
+    assert.equal(m.totalt, m.paMal + m.utanfor + m.iTack, namn)
+    // Den gamla modellen hade lagt målen ovanpå och gett en för hög total.
+    assert.equal(
+      m.totalt,
+      skott.on_goal + skott.missed + skott.blocked + mal,
+      namn,
+    )
+  }
+})
+
+test('matchhuvudet: lagets på mål inkluderar lagets mål för perioden', () => {
+  // Tungelsta gjorde 4 mål i period 2. Med 6 registrerade skott på mål i
+  // samma period blir lagets på mål 10, inte 6.
+  const m = shotModel({ on_goal: 6, missed: 5, blocked: 3 }, 4)
+  assert.equal(m.paMal, 10)
+  assert.equal(m.totalt, 18)
+})
+
+test('matchhuvudet: hela matchen ger hela matchens mål', () => {
+  // Tungelsta 8 mål, 14 registrerade skott på mål över hela matchen.
+  const m = shotModel({ on_goal: 14, missed: 12, blocked: 9 }, 8)
+  assert.equal(m.paMal, 22)
+  assert.equal(m.totalt, 43)
+})

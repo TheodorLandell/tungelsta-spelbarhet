@@ -107,3 +107,74 @@ test('malProcentText: utan registrering finns inget att visa', () => {
   assert.equal(malProcentText({ registrerat: false }), null)
   assert.equal(malProcentText(null), null)
 })
+
+// ---------------------------------------------------------------------------
+// Verklig match: IFK Haninge (C) - Tungelsta IF (B) 6-8, match_id 1723835
+//
+// Svaren nedan är exakt vad /api/stats returnerar för spelarna. Målen ligger
+// redan inne i pa_mal – de är ingen egen post.
+// ---------------------------------------------------------------------------
+
+const MATCH_1723835 = [
+  { namn: 'William Lindahl', mal: 3, regPaMal: 2, skott: {
+    registrerat: true, totalt: 7, mal: 3, malprocent: 60,
+    pa_mal: { antal: 5, andel: 72 },
+    utanfor: { antal: 1, andel: 14 },
+    i_tack: { antal: 1, andel: 14 } } },
+  { namn: 'Johnny Andersson', mal: 2, regPaMal: 1, skott: {
+    registrerat: true, totalt: 10, mal: 2, malprocent: 67,
+    pa_mal: { antal: 3, andel: 30 },
+    utanfor: { antal: 3, andel: 30 },
+    i_tack: { antal: 4, andel: 40 } } },
+  { namn: 'Adam Burgren', mal: 1, regPaMal: 4, skott: {
+    registrerat: true, totalt: 7, mal: 1, malprocent: 20,
+    pa_mal: { antal: 5, andel: 71 },
+    utanfor: { antal: 2, andel: 29 },
+    i_tack: { antal: 0, andel: 0 } } },
+  { namn: 'Felix Wikström', mal: 1, regPaMal: 0, skott: {
+    registrerat: true, totalt: 4, mal: 1, malprocent: 100,
+    pa_mal: { antal: 1, andel: 25 },
+    utanfor: { antal: 1, andel: 25 },
+    i_tack: { antal: 2, andel: 50 } } },
+  { namn: 'Tim Johannesson', mal: 1, regPaMal: 3, skott: {
+    registrerat: true, totalt: 5, mal: 1, malprocent: 25,
+    pa_mal: { antal: 4, andel: 80 },
+    utanfor: { antal: 0, andel: 0 },
+    i_tack: { antal: 1, andel: 20 } } },
+]
+
+test('verklig match: varje spelares på mål inkluderar hans mål', () => {
+  for (const { namn, mal, regPaMal, skott } of MATCH_1723835) {
+    const paMal = skottSegment(skott).find(s => s.key === 'pa_mal')
+    assert.equal(paMal.antal, regPaMal + mal, namn)
+    assert.ok(paMal.antal >= mal, `${namn}: på mål ska minst vara antalet mål`)
+  }
+})
+
+test('verklig match: fördelningen har exakt tre rader, ingen målrad', () => {
+  for (const { namn, skott } of MATCH_1723835) {
+    const seg = skottSegment(skott)
+    assert.equal(seg.length, 3, namn)
+    assert.deepEqual(seg.map(s => s.key), ['pa_mal', 'utanfor', 'i_tack'], namn)
+    assert.ok(!seg.some(s => s.key === 'mal'), `${namn}: mål ska inte vara en rad`)
+  }
+})
+
+test('verklig match: de tre andelarna summerar till 100 procent', () => {
+  for (const { namn, skott } of MATCH_1723835) {
+    const summa = skottSegment(skott).reduce((a, s) => a + s.andel, 0)
+    assert.equal(summa, 100, namn)
+  }
+})
+
+test('verklig match: segmenten summerar till totalen, målen dubbelräknas inte', () => {
+  for (const { namn, skott } of MATCH_1723835) {
+    const summa = skottSegment(skott).reduce((a, s) => a + s.antal, 0)
+    assert.equal(summa, skott.totalt, namn)
+  }
+})
+
+test('verklig match: målen visas under baren i stället', () => {
+  assert.equal(malProcentText(MATCH_1723835[1].skott), '2 mål av 3 på mål (67 %)')
+  assert.equal(malProcentText(MATCH_1723835[0].skott), '3 mål av 5 på mål (60 %)')
+})

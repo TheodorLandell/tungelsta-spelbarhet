@@ -399,6 +399,108 @@ class TestSkott:
 
 
 # ---------------------------------------------------------------------------
+# Verklig match: IFK Haninge (C) - Tungelsta IF (B) 6-8, match_id 1723835
+# ---------------------------------------------------------------------------
+
+# Spelarnas mål från iBIS lineups för den matchen. Siffrorna är verifierade mot
+# både lineups och matchhändelserna – de stämmer överens spelare för spelare.
+MATCH_1723835_MAL = {
+    132951: ("Johnny Andersson", 2),
+    480798: ("William Lindahl", 3),
+    490161: ("Adam Burgren", 1),
+    490139: ("Felix Wikström", 1),
+    538277: ("Tim Johannesson", 1),
+    205819: ("Martin Midelf", 0),
+    47205: ("Niklas Sandborg", 0),
+}
+
+# Registrerade skott under matchen. Johnny har 1 registrerat skott på mål och
+# 2 mål, vilket ska ge 3 på mål – exakt fallet som såg fel ut i statistikvyn.
+MATCH_1723835_SKOTT = {
+    132951: {"on_goal": 1, "missed": 3, "blocked": 4},
+    480798: {"on_goal": 2, "missed": 1, "blocked": 1},
+    490161: {"on_goal": 4, "missed": 2, "blocked": 0},
+    490139: {"on_goal": 0, "missed": 1, "blocked": 2},
+    538277: {"on_goal": 3, "missed": 0, "blocked": 1},
+    205819: {"on_goal": 2, "missed": 2, "blocked": 1},
+    47205: {"on_goal": 0, "missed": 0, "blocked": 0},
+}
+
+
+class TestVerkligMatch1723835:
+    def _seed(self, db):
+        add_match(db, 1723835, "B", datetime(2026, 9, 14, 20))
+        n = 0
+        for pid, (namn, mal) in MATCH_1723835_MAL.items():
+            add_player(db, pid, namn, str(pid)[:2])
+            add_appearance(db, 1723835, pid, namn, goals=mal)
+            for kind, antal in MATCH_1723835_SKOTT[pid].items():
+                for _ in range(antal):
+                    n += 1
+                    add_shot(db, f"s{n}", 1723835, pid, kind)
+        db.flush()
+
+    def test_varje_spelares_pa_mal_inkluderar_hans_mal(self, client, db):
+        self._seed(db)
+        rader = rows_by_id(client.get("/api/stats?team=B").json())
+
+        for pid, (namn, mal) in MATCH_1723835_MAL.items():
+            skott = rader[pid]["skott"]
+            registrerade = MATCH_1723835_SKOTT[pid]["on_goal"]
+
+            assert skott["pa_mal"]["antal"] == registrerade + mal, namn
+            assert skott["pa_mal"]["antal"] >= mal, namn
+            assert skott["mal"] == mal, namn
+
+    def test_johnny_andersson_har_tre_pa_mal_och_67_procents_malprocent(
+        self, client, db
+    ):
+        # Fallet ur statistikvyn: 2 mål, 1 registrerat skott på mål.
+        self._seed(db)
+        rad = rows_by_id(client.get("/api/stats?team=B").json())[132951]
+
+        assert rad["mal"] == 2
+        assert rad["skott"]["pa_mal"]["antal"] == 3     # 1 registrerat + 2 mål
+        assert rad["skott"]["mal"] == 2
+        assert rad["skott"]["malprocent"] == 67         # 2 av 3
+        # Totalt = 3 på mål + 3 utanför + 4 i täck
+        assert rad["skott"]["totalt"] == 10
+
+    def test_totalen_ar_pa_mal_plus_utanfor_plus_i_tack(self, client, db):
+        self._seed(db)
+        rader = rows_by_id(client.get("/api/stats?team=B").json())
+
+        for pid, (namn, _mal) in MATCH_1723835_MAL.items():
+            skott = rader[pid]["skott"]
+            assert skott["totalt"] == (
+                skott["pa_mal"]["antal"]
+                + skott["utanfor"]["antal"]
+                + skott["i_tack"]["antal"]
+            ), namn
+
+    def test_de_tre_andelarna_summerar_till_100_for_varje_spelare(self, client, db):
+        self._seed(db)
+        rader = rows_by_id(client.get("/api/stats?team=B").json())
+
+        for pid, (namn, _mal) in MATCH_1723835_MAL.items():
+            skott = rader[pid]["skott"]
+            andelar = [skott[k]["andel"] for k in ("pa_mal", "utanfor", "i_tack")]
+            if skott["totalt"] == 0:
+                # Ingen fördelning att göra – inga andelar alls.
+                assert andelar == [None, None, None], namn
+            else:
+                assert sum(andelar) == 100, f"{namn}: {andelar}"
+
+    def test_mal_ar_inte_en_egen_post_i_fordelningen(self, client, db):
+        self._seed(db)
+        rad = rows_by_id(client.get("/api/stats?team=B").json())[132951]
+
+        # Mål är ett värde, inte ett segment med antal och andel.
+        assert not isinstance(rad["skott"]["mal"], dict)
+        assert "andel" not in str(rad["skott"]["mal"])
+
+
+# ---------------------------------------------------------------------------
 # Roster edits slår igenom (SPEC 6.5)
 # ---------------------------------------------------------------------------
 
