@@ -254,14 +254,33 @@ function mergeLive(detail, liveRow) {
     resultat: liveRow.resultat ?? detail.resultat,
     mal: liveRow.mal ?? detail.mal,
     motstandare_mal: liveRow.motstandare_mal ?? detail.motstandare_mal,
+    // Perioduppdelningen följer med (SPEC 6.7) – annars skulle en pågående
+    // match visa live-målen i fel period. null är ett giltigt värde här och
+    // betyder "ingen periodinformation", så ?? duger inte.
+    mal_perioder:
+      liveRow.mal != null ? liveRow.mal_perioder : detail.mal_perioder,
+    mal_utan_period:
+      liveRow.mal != null ? liveRow.mal_utan_period : detail.mal_utan_period,
+    motstandare_mal_perioder:
+      liveRow.motstandare_mal != null
+        ? liveRow.motstandare_mal_perioder
+        : detail.motstandare_mal_perioder,
+    motstandare_mal_utan_period:
+      liveRow.motstandare_mal != null
+        ? liveRow.motstandare_mal_utan_period
+        : detail.motstandare_mal_utan_period,
     trupp: (detail.trupp ?? []).map(p => {
       const s = bySpelare.get(p.player_id)
       return s
         ? {
             ...p,
             mal: s.mal,
+            mal_perioder: s.mal_perioder,
+            mal_utan_period: s.mal_utan_period,
             assist: s.assist,
             utvisningsminuter: s.utvisningsminuter,
+            utv_perioder: s.utv_perioder,
+            utv_utan_period: s.utv_utan_period,
           }
         : p
     }),

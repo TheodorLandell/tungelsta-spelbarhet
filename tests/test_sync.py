@@ -143,10 +143,37 @@ def make_player_dict(
     }
 
 
+def make_event_dict(
+    event_id: int,
+    event_type: int,
+    period: int | None,
+    player_id: int,
+    *,
+    assist_id: int = 0,
+    penalty_name: str = "",
+    penalty_code: str = "",
+    minute: int = 0,
+    second: int = 0,
+) -> dict:
+    """En rad i Events[]. event_type 1 = mål, 2 = utvisning."""
+    return {
+        "MatchEventID": event_id,
+        "MatchEventTypeID": event_type,
+        "Period": period,
+        "Minute": minute,
+        "Second": second,
+        "PlayerID": player_id,
+        "PlayerAssistID": assist_id,
+        "PenaltyCode": penalty_code,
+        "PenaltyName": penalty_name,
+    }
+
+
 def build_client(
     team_a_dict: dict | None = None,
     team_b_dict: dict | None = None,
     lineups_by_id: dict[int, dict] | None = None,
+    events_by_id: dict[int, list[dict]] | None = None,
 ) -> IBISClient:
     client = MagicMock(spec=IBISClient)
 
@@ -161,8 +188,13 @@ def build_client(
         )
         return IBISLineups.model_validate(data)
 
+    def fetch_match_raw(match_id):
+        # Events är null i lag-endpointen och fylls först här (SPEC 6.7).
+        return {"MatchID": match_id, "Events": (events_by_id or {}).get(match_id)}
+
     client.fetch_team_raw.side_effect = fetch_team_raw
     client.fetch_lineups.side_effect = fetch_lineups
+    client.fetch_match_raw.side_effect = fetch_match_raw
     return client
 
 
@@ -376,9 +408,12 @@ class TestRunSync:
     def test_redan_komplett_match_hoppar_lineups(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
 
-        # Förbered match + appearances i DB
+        # Förbered match + appearances i DB. stats_final_ts visar att
+        # statistiken hämtades efter slutrapporten – då finns inget nytt att
+        # hämta (SPEC 3.5).
         db.add(Match(match_id=1004, team="A", competition_id=100,
-                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={}))
+                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={},
+                     stats_final_ts="2020-01-15T21:00:00"))
         db.add(Player(player_id=42, name="Kalle", last_seen=datetime(2020, 1, 15, 19)))
         db.add(Appearance(match_id=1004, player_id=42, player_name="Kalle"))
         db.flush()
@@ -839,7 +874,8 @@ class TestAppearanceStats:
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
 
         db.add(Match(match_id=5004, team="A", competition_id=100,
-                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={}))
+                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={},
+                     stats_final_ts="2020-01-15T21:00:00"))
         db.add(Player(player_id=45, name="Kalle", last_seen=datetime(2020, 1, 15, 19)))
         db.add(Appearance(match_id=5004, player_id=45, player_name="Kalle", goals=1))
         db.flush()
@@ -849,6 +885,44 @@ class TestAppearanceStats:
 
         assert run_sync(db, client).ok is True
         client.fetch_lineups.assert_not_called()
+
+    def test_statistik_hamtad_mitt_i_matchen_hamtas_om_efter_slutrapport(
+        self, db, monkeypatch
+    ):
+        """
+        Trupper publiceras före matchstart, så appearances skrivs redan under
+        matchens gång – och är då halvfärdiga. En spelare som får sin andra
+        utvisning i tredje perioden hann sparas med 2 minuter i stället för 4.
+
+        Matchen måste därför hämtas om en gång efter slutrapporten. Det är
+        skillnaden mot testet ovan: där hämtades statistiken redan efter
+        slutrapporten, här mitt under matchen (stats_final_ts är null).
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        db.add(Match(match_id=5005, team="A", competition_id=100,
+                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={},
+                     stats_final_ts=None))
+        db.add(Player(player_id=46, name="Joacim", last_seen=datetime(2020, 1, 15, 19)))
+        db.add(Appearance(match_id=5005, player_id=46, player_name="Joacim",
+                          penalty_minutes=2))
+        db.flush()
+
+        m = self._played_match(5005)
+        lineups = make_lineups_dict(5005, away_players=[
+            make_player_dict(46, "Joacim", penalty_minutes=4),
+        ])
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={5005: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+
+        client.fetch_lineups.assert_called_once_with(5005)
+        assert db.get(Appearance, (5005, 46)).penalty_minutes == 4
+        # Stämpeln sätts, så nästa synk hoppar över matchen.
+        assert db.get(Match, 5005).stats_final_ts == "2020-01-15T21:00:00"
 
 
 class TestGoalkeeperFlag:
@@ -1037,6 +1111,7 @@ class TestBefintligMatchUppdateras:
                 "GoalsHomeTeam": 2, "GoalsAwayTeam": 2,
                 "FinalResultCreatedTS": "2026-08-01T21:00:00",
             },
+            stats_final_ts="2026-08-01T21:00:00",
         ))
         db.add(Player(player_id=42, name="Kalle", last_seen=datetime(2026, 8, 1)))
         db.add(Appearance(match_id=1002, player_id=42, player_name="Kalle"))

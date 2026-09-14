@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -40,14 +41,18 @@ from app.auth import (
 from app.config import settings
 from app.database import SessionLocal
 from app.ibis_client import (
+    EVENT_GOAL,
     IBISClient,
     IBISMatch,
     get_team_players,
     is_played,
+    parse_match_events,
+    penalty_minutes_from_name,
 )
 from app.models import (
     Appearance,
     Match,
+    MatchEvent,
     Override,
     Player,
     PlayerTeam,
@@ -55,6 +60,7 @@ from app.models import (
     ShotEvent,
     SyncLog,
 )
+from app.periods import split_by_period, team_periods_from_raw
 from app.stats import SCOPES, compute_stats
 from app.status import get_statuses
 from app.sync import _match_status, _now_naive, run_sync
@@ -620,6 +626,58 @@ def _roster_edit_cell(e: RosterEdit) -> dict[str, Any]:
     }
 
 
+def _team_period_split(
+    m: Match, total: int | None, *, egen: bool
+) -> tuple[dict[int, int] | None, int]:
+    """
+    Ett lags mål per period till matchhuvudet (SPEC 6.7).
+
+    ``egen=True`` ger vårt lag, ``egen=False`` motståndaren. Vilken sida i
+    IntermediateResults som är vår avgörs av om vi spelar hemma.
+    """
+    if total is None:
+        return None, 0
+
+    raw = m.raw or {}
+    home_id = raw.get("HomeTeamID")
+    if home_id is None:
+        return None, total
+
+    vi_ar_hemma = home_id == _team_id_for(m.team)
+    hemma_sida = vi_ar_hemma if egen else not vi_ar_hemma
+
+    perioder = team_periods_from_raw(raw, hemma=hemma_sida)
+    if perioder is None:
+        # Inga periodsiffror: målen räknas bara i "hela matchen".
+        return None, total
+    return split_by_period(total, perioder)
+
+
+def _period_breakdown(db: Session, match_id: int) -> tuple[dict, dict]:
+    """
+    Mål och utvisningsminuter per spelare och period ur match_events (SPEC 6.7).
+
+    Returnerar två uppslag: ``{player_id: {period: antal}}`` för mål och samma
+    för utvisningsminuter. En utvisning vars längd inte gick att läsa ur
+    PenaltyName räknas som noll minuter här och hamnar därmed som "okänd
+    period" när totalen fördelas – hellre saknad siffra än fel siffra.
+    """
+    mal: dict[int, dict[int, int]] = {}
+    utv: dict[int, dict[int, int]] = {}
+
+    for e in db.scalars(
+        select(MatchEvent).where(MatchEvent.match_id == match_id)
+    ).all():
+        if e.period is None:
+            continue
+        target = mal if e.kind == "goal" else utv
+        bucket = target.setdefault(e.player_id, {})
+        antal = 1 if e.kind == "goal" else (e.penalty_minutes or 0)
+        bucket[e.period] = bucket.get(e.period, 0) + antal
+
+    return mal, utv
+
+
 def _match_detail(db: Session, m: Match) -> dict[str, Any]:
     data = _match_summary(m)
     spelad = m.status == "played"
@@ -630,6 +688,8 @@ def _match_detail(db: Session, m: Match) -> dict[str, Any]:
             select(Appearance).where(Appearance.match_id == m.match_id)
         ).all()
     }
+
+    mal_events, utv_events = _period_breakdown(db, m.match_id)
 
     # Roster edits ligger som ett lager ovanpå iBIS (SPEC 6.5). En borttagen
     # spelare försvinner ur listan, en tillagd läggs till. Slår igenom på både
@@ -680,16 +740,34 @@ def _match_detail(db: Session, m: Match) -> dict[str, Any]:
     for pid in effective_ids:
         a = apps.get(pid)  # None för en tillagd spelare utan iBIS-appearance
         e = edits.get(pid)
+        har_stat = spelad and a is not None
+
+        # Totalen från lineups är den auktoritativa siffran; matchhändelserna
+        # säger bara vilken period den hör till. Det som inte går att placera
+        # räknas bara i "hela matchen" (SPEC 6.7).
+        if har_stat:
+            mal_perioder, mal_utan = split_by_period(
+                a.goals, mal_events.get(pid, {})
+            )
+            utv_perioder, utv_utan = split_by_period(
+                a.penalty_minutes, utv_events.get(pid, {})
+            )
+        else:
+            mal_perioder = utv_perioder = None
+            mal_utan = utv_utan = 0
+
         trupp.append({
             "player_id": pid,
             "namn": _name(pid),
             "trojnummer": _shirt(pid),
             "malvakt": _is_gk(pid),
-            "mal": a.goals if (spelad and a is not None) else None,
-            "assist": a.assists if (spelad and a is not None) else None,
-            "utvisningsminuter": (
-                a.penalty_minutes if (spelad and a is not None) else None
-            ),
+            "mal": a.goals if har_stat else None,
+            "mal_perioder": mal_perioder,
+            "mal_utan_period": mal_utan,
+            "assist": a.assists if har_stat else None,
+            "utvisningsminuter": a.penalty_minutes if har_stat else None,
+            "utv_perioder": utv_perioder,
+            "utv_utan_period": utv_utan,
             "roster_edit": _roster_edit_cell(e) if e is not None else None,
         })
 
@@ -747,6 +825,17 @@ def _match_detail(db: Session, m: Match) -> dict[str, Any]:
             data["mal"], data["motstandare_mal"] = resultat["borta"], resultat["hemma"]
     else:
         data["mal"] = data["motstandare_mal"] = None
+
+    # Lagmål per period kommer från IntermediateResults, som till skillnad från
+    # Events är ifylld redan i lag-endpointen och därför alltid finns i raw
+    # (SPEC 6.7). Ingen extra hämtning behövs för matchhuvudet.
+    data["mal_perioder"], data["mal_utan_period"] = _team_period_split(
+        m, data["mal"], egen=True
+    )
+    (
+        data["motstandare_mal_perioder"],
+        data["motstandare_mal_utan_period"],
+    ) = _team_period_split(m, data["motstandare_mal"], egen=False)
 
     data["spelad"] = spelad
     data["trupp_publicerad"] = len(trupp) > 0
@@ -813,6 +902,18 @@ def _ongoing_matches(db: Session) -> list[Match]:
     return [m for m in rows if not (m.raw or {}).get("FinalResultCreatedTS")]
 
 
+def _split_from_raw(
+    md: dict, total: int | None, *, hemma: bool
+) -> tuple[dict[int, int] | None, int]:
+    """Perioduppdelning av ett lags mål ur ett rått matchobjekt."""
+    if total is None:
+        return None, 0
+    perioder = team_periods_from_raw(md, hemma=hemma)
+    if perioder is None:
+        return None, total
+    return split_by_period(total, perioder)
+
+
 def _live_match_row(client: IBISClient, m: Match, md: dict, team_id: int) -> dict:
     ibis_match = IBISMatch.model_validate(md)
     played = is_played(ibis_match)
@@ -839,23 +940,71 @@ def _live_match_row(client: IBISClient, m: Match, md: dict, team_id: int) -> dic
     if played:
         try:
             lineups = client.fetch_lineups(m.match_id)
-            for p in get_team_players(lineups, team_id):
+            players = get_team_players(lineups, team_id)
+
+            # Events ger perioden, men är null i lag-endpointen. Under matchen
+            # är det just periodsiffrorna tränaren tittar på, så matchobjektet
+            # hämtas separat (SPEC 6.6, 6.7). Misslyckas det visas målen ändå,
+            # bara utan perioduppdelning.
+            mal_ev: dict[int, dict[int, int]] = {}
+            utv_ev: dict[int, dict[int, int]] = {}
+            try:
+                for e in parse_match_events(client.fetch_match_raw(m.match_id)):
+                    if e.Period is None or e.PlayerID is None:
+                        continue
+                    if e.MatchEventTypeID == EVENT_GOAL:
+                        b = mal_ev.setdefault(e.PlayerID, {})
+                        b[e.Period] = b.get(e.Period, 0) + 1
+                    else:
+                        minuter = penalty_minutes_from_name(e.PenaltyName) or 0
+                        b = utv_ev.setdefault(e.PlayerID, {})
+                        b[e.Period] = b.get(e.Period, 0) + minuter
+            except (httpx.HTTPError, ValueError, KeyError):
+                pass
+
+            for p in players:
+                p_mal = p.Goals or 0
+                p_utv = p.PenaltyMinutes or 0
+                mal_perioder, mal_utan = split_by_period(
+                    p_mal, mal_ev.get(p.PlayerID, {})
+                )
+                utv_perioder, utv_utan = split_by_period(
+                    p_utv, utv_ev.get(p.PlayerID, {})
+                )
                 spelare.append({
                     "player_id": p.PlayerID,
-                    "mal": p.Goals or 0,
+                    "mal": p_mal,
+                    "mal_perioder": mal_perioder,
+                    "mal_utan_period": mal_utan,
                     "assist": p.Assists or 0,
-                    "utvisningsminuter": p.PenaltyMinutes or 0,
+                    "utvisningsminuter": p_utv,
+                    "utv_perioder": utv_perioder,
+                    "utv_utan_period": utv_utan,
                 })
         except ValueError:
             # Laget finns inte i lineupen än – ta med resultatet ändå.
             pass
+
+    # Lagmål per period: IntermediateResults finns redan i matchobjektet från
+    # lag-endpointen, så det kostar inget extra anrop.
+    egen_perioder = egen_utan = None
+    mot_perioder = mot_utan = None
+    if mal is not None and hemma is not None:
+        egen_perioder, egen_utan = _split_from_raw(md, mal, hemma=hemma)
+        mot_perioder, mot_utan = _split_from_raw(
+            md, motstandare_mal, hemma=not hemma
+        )
 
     return {
         "match_id": m.match_id,
         "status": _match_status(ibis_match),
         "hemma": hemma,
         "mal": mal,
+        "mal_perioder": egen_perioder,
+        "mal_utan_period": egen_utan or 0,
         "motstandare_mal": motstandare_mal,
+        "motstandare_mal_perioder": mot_perioder,
+        "motstandare_mal_utan_period": mot_utan or 0,
         "resultat": resultat,
         "spelare": spelare,
     }

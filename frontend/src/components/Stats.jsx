@@ -6,12 +6,12 @@ import {
   statsQuery,
   beskrivOmfattning,
   skottSegment,
+  malProcentText,
 } from '../lib/stats'
 
 const OMF_KEY = 'stats_omfattning'
 
 const SEGMENT_FARG = {
-  mal: 'bg-emerald-500',
   pa_mal: 'bg-black',
   utanfor: 'bg-amber-500',
   i_tack: 'bg-gray-400',
@@ -112,6 +112,12 @@ function Skottfordelning({ skott }) {
           </li>
         ))}
       </ul>
+
+      {/* Mål är inget eget segment – de ingår i på mål. De visas i stället
+          här, med målprocenten (SPEC 7). */}
+      <p className="mt-1.5 text-xs text-gray-500 tabular-nums">
+        {malProcentText(skott)}
+      </p>
     </div>
   )
 }

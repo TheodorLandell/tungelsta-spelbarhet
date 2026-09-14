@@ -27,6 +27,13 @@ class Match(Base):
     date_missing: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0"
     )
+    # FinalResultCreatedTS som gällde när appearances senast hämtades. Trupper
+    # publiceras före matchstart, så statistiken skrivs även mitt under matchen
+    # – och då är den halvfärdig. Synken får därför bara hoppa över en match
+    # vars statistik hämtades *efter* att slutresultatet rapporterades, alltså
+    # när det här värdet är satt och lika med matchens nuvarande
+    # FinalResultCreatedTS. Null betyder "hämta om" (SPEC 3.5).
+    stats_final_ts: Mapped[str | None] = mapped_column(String(32), nullable=True)
     raw: Mapped[dict] = mapped_column(JSON)
 
     appearances: Mapped[list["Appearance"]] = relationship(back_populates="match")
@@ -151,6 +158,38 @@ class ShotEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
     created_by: Mapped[str | None] = mapped_column(Text, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class MatchEvent(Base):
+    """
+    Mål och utvisningar från iBIS Events[] (SPEC 6.7).
+
+    Enda källan till *vilken period* ett mål gjordes i. Events är null i
+    lag-endpointen och fylls först i /matches/{id} när matchen spelats, så
+    tabellen är tom för matcher där iBIS ännu inte publicerat händelserna.
+
+    Primärnyckeln är iBIS eget MatchEventID, så en omsynk skriver över samma
+    rad i stället för att skapa dubbletter. Bara händelser för våra egna
+    spelare sparas – motståndarnas mål per period kommer från
+    IntermediateResults i stället, som redan ligger i matchens raw.
+
+    penalty_minutes är null när längden inte gick att läsa ur PenaltyName. En
+    sådan utvisning räknas bara i "hela matchen" (se app/periods.py).
+    """
+
+    __tablename__ = "match_events"
+
+    match_event_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    match_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("matches.match_id"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))          # 'goal' | 'penalty'
+    period: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    player_id: Mapped[int] = mapped_column(Integer, ForeignKey("players.player_id"))
+    assist_player_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    penalty_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    minute: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    second: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class SyncLog(Base):

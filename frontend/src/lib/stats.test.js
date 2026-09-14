@@ -10,6 +10,7 @@ import {
   statsQuery,
   beskrivOmfattning,
   skottSegment,
+  malProcentText,
 } from './stats.js'
 
 test('statsQuery: sasong tar inte med n', () => {
@@ -59,17 +60,50 @@ test('skottSegment: utan registrering ger tom lista', () => {
   assert.deepEqual(skottSegment(null), [])
 })
 
-test('skottSegment: fyra segment i visningsordning', () => {
-  const skott = {
-    registrerat: true,
-    totalt: 8,
-    mal: { antal: 2, andel: 25 },
-    pa_mal: { antal: 4, andel: 50 },
-    utanfor: { antal: 1, andel: 13 },
-    i_tack: { antal: 1, andel: 12 },
-  }
-  const seg = skottSegment(skott)
-  assert.deepEqual(seg.map(s => s.key), ['mal', 'pa_mal', 'utanfor', 'i_tack'])
-  assert.deepEqual(seg.map(s => s.antal), [2, 4, 1, 1])
+// 2 mål + 4 registrerade skott på mål = 6 på mål. Totalen är 6 + 1 + 1 = 8.
+const SKOTT = {
+  registrerat: true,
+  totalt: 8,
+  mal: 2,
+  malprocent: 33,
+  pa_mal: { antal: 6, andel: 75 },
+  utanfor: { antal: 1, andel: 13 },
+  i_tack: { antal: 1, andel: 12 },
+}
+
+test('skottSegment: tre segment i visningsordning, mål är inget eget', () => {
+  const seg = skottSegment(SKOTT)
+  assert.deepEqual(seg.map(s => s.key), ['pa_mal', 'utanfor', 'i_tack'])
+  assert.deepEqual(seg.map(s => s.antal), [6, 1, 1])
+})
+
+test('skottSegment: de tre andelarna summerar till 100 procent', () => {
+  const seg = skottSegment(SKOTT)
+  assert.equal(seg.length, 3)
   assert.equal(seg.reduce((a, s) => a + s.andel, 0), 100)
+})
+
+test('skottSegment: målen ingår i på mål och dubbelräknas inte i totalen', () => {
+  const seg = skottSegment(SKOTT)
+  // Summan av segmenten är hela totalen – målen ligger redan i på mål.
+  assert.equal(seg.reduce((a, s) => a + s.antal, 0), SKOTT.totalt)
+})
+
+test('malProcentText: mål och målprocent under baren', () => {
+  assert.equal(malProcentText(SKOTT), '2 mål av 6 på mål (33 %)')
+})
+
+test('malProcentText: utan skott på mål visas ingen procent', () => {
+  const skott = {
+    registrerat: true, totalt: 1, mal: 0, malprocent: null,
+    pa_mal: { antal: 0, andel: 0 },
+    utanfor: { antal: 1, andel: 100 },
+    i_tack: { antal: 0, andel: 0 },
+  }
+  assert.equal(malProcentText(skott), '0 mål av 0 på mål')
+})
+
+test('malProcentText: utan registrering finns inget att visa', () => {
+  assert.equal(malProcentText({ registrerat: false }), null)
+  assert.equal(malProcentText(null), null)
 })

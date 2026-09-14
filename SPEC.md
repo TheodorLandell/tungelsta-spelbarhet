@@ -142,11 +142,13 @@ Ett jobb en gång per dygn, plus en manuell "Uppdatera"-knapp.
 3. Spara/uppdatera trupperna från `Players[]` för båda lagen (upsert på
    `PlayerID`, skriv aldrig över befintligt tröjnummer med null)
 4. För varje spelad match som saknas: hämta lineups, spara appearances
-   inklusive `Goals`, `Assists`, `PenaltyMinutes`
+   inklusive `Goals`, `Assists`, `PenaltyMinutes`, och hämta matchobjektet för
+   `Events[]` och spara `match_events` (6.7)
 5. Logga till `sync_log`
 6. Räkna om regelmotorn och cacha resultatet
 
-Sekventiella anrop med kort paus. Färdigrapporterade matcher hämtas inte om.
+Sekventiella anrop med kort paus. Färdigrapporterade matcher hämtas inte om –
+men bara när statistiken hämtades efter slutrapporten, se 6.7.
 
 ---
 
@@ -162,6 +164,8 @@ matches
   round_name
   opponent
   venue
+  stats_final_ts    text, FinalResultCreatedTS vid senaste statistikhämtningen
+                    null = hämta om (se 6.7)
   raw               json
 
 appearances
@@ -169,11 +173,23 @@ appearances
   player_id
   player_name
   shirt_no
-  goals             int
+  goals             int        matchens total, auktoritativ
   assists           int
-  penalty_minutes   int
+  penalty_minutes   int        matchens total, auktoritativ
   source            'ibis' | 'manual'
   PRIMARY KEY (match_id, player_id)
+
+match_events
+  match_event_id    PK, iBIS MatchEventID – omsynk skriver över, aldrig dubblett
+  match_id          FK
+  kind              'goal' | 'penalty'
+  period            1 | 2 | 3, null om iBIS inte angav någon
+  player_id         FK, bara våra egna spelare
+  assist_player_id  FK, null för utvisningar
+  penalty_minutes   int, null när längden inte gick att läsa ur PenaltyName
+  minute, second    int
+  Ger perioden för mål och utvisningar (6.7). Tom för matcher där iBIS ännu
+  inte publicerat Events.
 
 players
   player_id         PK
@@ -278,12 +294,14 @@ bindestreck mellan siffrorna. Lagnamn får radbrytas om de är långa utan att
 mittkolumnen flyttar sig. Direkt under respektive lagnamn, i samma kolumn som
 laget, en liten rad med lagets skott: skott totalt, på mål, utanför, i täck –
 bara antal, inga andelar, ingen stjärna. Lagstatistiken följer vald period
-precis som spelarnas, inklusive läget "Hela matchen". Totala skott = mål + på
-mål + utanför + i täck, som för spelarna. Före matchen är mittkolumnen tom men
-behåller exakt samma bredd – inga platshållarrutor med streck. När iBIS
-rapporterat visas siffrorna, även 0-0; live-uppdateringen (6.6) fyller dem under
-matchens gång. Datum, hall och "ej spelad än" hör hemma i matchlistan och visas
-inte i huvudet.
+precis som spelarnas, inklusive läget "Hela matchen", och målen räknas bara i
+den period de gjordes i (6.7). Totala skott = på mål + utanför + i täck, som för
+spelarna. Själva resultatet i mittkolumnen är däremot alltid hela matchens
+ställning, oavsett vald period – det är matchens resultat, inte en periodsiffra.
+Före matchen är mittkolumnen tom men behåller exakt samma bredd – inga
+platshållarrutor med streck. När iBIS rapporterat visas siffrorna, även 0-0;
+live-uppdateringen (6.6) fyller dem under matchens gång. Datum, hall och "ej
+spelad än" hör hemma i matchlistan och visas inte i huvudet.
 
 **Tre kategorier registreras manuellt:**
 
@@ -291,11 +309,16 @@ inte i huvudet.
 - `missed` – skott utanför
 - `blocked` – skott i täck
 
-**Mål registreras inte manuellt.** De hämtas från iBIS och är en egen kategori.
-Tränaren ska alltså *inte* trycka när ett skott går in. Detsamma gäller
-motståndarens mål: de hämtas från iBIS som våra egna, aldrig manuellt.
+**Mål registreras inte manuellt.** De hämtas från iBIS. Tränaren ska alltså
+*inte* trycka när ett skott går in. Detsamma gäller motståndarens mål: de hämtas
+från iBIS som våra egna, aldrig manuellt.
 
-**Totala skott** = mål + skott på mål + skott utanför + skott i täck. Räknas fram,
+**Ett mål är ett skott på mål.** Skott på mål = registrerade `on_goal` **plus**
+mål från iBIS. Eftersom tränaren inte trycker när bollen går in skulle målen
+annars saknas helt i skottbilden.
+
+**Totala skott** = på mål + utanför + i täck. Målen ingår i på mål och räknas
+aldrig separat i totalen – annars skulle varje mål räknas dubbelt. Räknas fram,
 knappas aldrig in.
 
 **Kontroller.** Per spelare och kategori: en stor plusknapp som visar antalet, och
@@ -328,7 +351,7 @@ matchhuvudet betyder det ett blankt resultat tills något rapporterats; i
 spelarlistan en tom målruta, inte en nolla, så att det inte ser ut som att
 spelaren saknar mål. Ingen stjärna och ingen förklarande fotnot – live-
 uppdateringen (6.6) fyller siffrorna under matchen och nattjobbet stämmer av
-resten.
+resten. Målrutan följer vald period, precis som skottsiffrorna (6.7).
 
 ### 6.3 Local-first
 
@@ -399,6 +422,55 @@ statistikvyn uppdateras fortfarande bara via Uppdatera-knappen och nattjobbet.
 uppkoppling visar "Offline", serverfel eller felkod visar "Error", och när allt
 fungerar visas ingen ruta alls.
 
+### 6.7 Mål och utvisningar per period
+
+Ett mål ska bara räknas i den period det gjordes i. Detsamma gäller
+utvisningsminuter.
+
+**Källorna.** Två endpoints behövs, och de svarar på olika frågor:
+
+| Källa | Ger | Finns |
+|-------|-----|-------|
+| `lineups` → `Goals`, `PenaltyMinutes` | Matchens **totaler** per spelare | Alltid för en spelad match |
+| `GET /matches/{id}` → `Events[]` | **Perioden** för varje enskild händelse | Först när matchen spelats |
+| `IntermediateResults[]` | Lagets mål per period | Redan i lag-endpointen |
+
+`Events` är **null i lag-endpointen** (`/seasons/{id}/teams/{id}`), som synken i
+övrigt bygger på. Periodinformation per spelare kostar därför ett extra
+`GET /matches/{id}` per spelad match. `IntermediateResults` är däremot ifylld
+redan där och ligger i matchens `raw`, så matchhuvudets lagsiffror kostar inget
+extra anrop.
+
+Händelsetyper i `Events[]`: `MatchEventTypeID` `1` = mål, `2` = utvisning. Resten
+(periodstart/slut, timeout, målvaktsbyten) ignoreras.
+
+**Utvisningens längd finns inte som eget fält.** Bara `PenaltyCode` (`"201"`) och
+`PenaltyName` (`"Slag, 2 min"`, `"Hårt spel 2 min"` – formatet varierar).
+Minuterna läses ur texten, och bara när texten innehåller exakt ett tal som följs
+av "min". Går det inte att läsa räknas längden som okänd i stället för att gissas.
+
+**Totalen är auktoritativ, perioden är en uppdelning.** Uppdelningen får aldrig
+motsäga totalen från lineups:
+
+- Täcker händelserna totalen → perioder som de är
+- Täcker de bara en del → resten räknas som okänd period
+- Säger händelserna *mer* än totalen → hela uppdelningen är opålitlig, allt
+  räknas som okänd period
+
+**Okänd period räknas bara i "Hela matchen"**, aldrig i någon enskild period.
+Hellre en saknad siffra än en felaktig. UI markerar det: en prick vid siffran och
+en kort rad under periodväljaren som säger varför. Perioder utanför 1–3
+(förlängning) har ingen plats i periodväljaren och behandlas som okänd period.
+
+**Synken får inte frysa halvfärdiga siffror.** Trupper publiceras i iBIS före
+matchstart, så appearances skrivs redan före och under matchen – och är då
+ofullständiga. En spelare som får sin andra utvisning i tredje perioden hinner
+sparas med halva antalet minuter. Regeln i 3.5 ("färdigrapporterade matcher
+hämtas inte om") gäller därför bara när statistiken hämtades **efter** att
+slutresultatet rapporterades. `matches.stats_final_ts` håller vilket
+`FinalResultCreatedTS` som gällde vid den senaste hämtningen; är det null eller
+ett annat värde hämtas matchen om.
+
 ---
 
 ## 7. Del 3 – Statistik
@@ -412,13 +484,18 @@ Per spelare, för valt lag och vald omfattning.
 | Assist | iBIS |
 | Poäng | Mål + assist |
 | Utvisningsminuter | iBIS |
-| Skott totalt | Mål + på mål + utanför + i täck |
-| Mål | antal och andel av totala skott |
+| Skott totalt | På mål + utanför + i täck |
 | På mål | antal och andel av totala skott |
 | Utanför | antal och andel av totala skott |
 | I täck | antal och andel av totala skott |
+| Mål | antal, plus målprocent = mål delat med skott på mål |
 
-De fyra andelarna summerar till 100 %.
+**Ett mål är ett skott på mål** (6.2). "På mål" är alltså registrerade `on_goal`
+plus mål från iBIS, och målen ingår i totalen via på mål – aldrig som en egen
+post ovanpå.
+
+**De tre andelarna** – på mål, utanför, i täck – summerar till 100 %. Mål är
+ingen fjärde andel utan visas som eget värde tillsammans med målprocenten.
 
 **Urval.** Överst sitter lagväljaren A/B – samma väljare som i matchlistan, och
 en av de två vyer där den visas – och omfattningsvalet: senaste matchen, de

@@ -13,6 +13,7 @@ import {
 } from '../lib/shotStore'
 import { syncMatch, SyncError } from '../lib/shotSync'
 import { matchesPlayerQuery } from '../lib/search'
+import { malTal, motstandareMalTal, shotModel } from '../lib/periods'
 import MatchHeader from './MatchHeader'
 import PlayerSearch from './PlayerSearch'
 
@@ -135,19 +136,29 @@ function PlayerCard({
   player,
   counts,
   totalCounts,
-  malFromIbis,
+  period,
   onPlus,
   onMinus,
   disabled,
   overview,
 }) {
-  // "Totalt" är alltid hela matchen, oavsett vald period.
-  const tOnGoal = totalCounts.get(`${player.player_id}:on_goal`) || 0
-  const tMissed = totalCounts.get(`${player.player_id}:missed`) || 0
-  const tBlocked = totalCounts.get(`${player.player_id}:blocked`) || 0
+  // "Totalt" är alltid hela matchen, oavsett vald period (SPEC 6.2). Målen som
+  // ingår är därför matchens alla mål, och de räknas in i på mål – aldrig som
+  // en egen post ovanpå (SPEC 6.2).
+  const total = shotModel(
+    {
+      on_goal: totalCounts.get(`${player.player_id}:on_goal`) || 0,
+      missed: totalCounts.get(`${player.player_id}:missed`) || 0,
+      blocked: totalCounts.get(`${player.player_id}:blocked`) || 0,
+    },
+    player.mal,
+  ).totalt
 
-  const malKnown = typeof malFromIbis === 'number'
-  const total = (malKnown ? malFromIbis : 0) + tOnGoal + tMissed + tBlocked
+  // Målrutan följer vald period: ett mål räknas bara i den period det gjordes
+  // i (SPEC 6.7). Mål vars period är okänd syns bara i "Hela matchen" och
+  // markeras med en prick.
+  const { varde: malForPeriod, okant: okandPeriod } = malTal(player, period)
+  const malKnown = typeof malForPeriod === 'number'
 
   return (
     <div className={`px-3 py-3 ${overview ? 'bg-gray-50' : ''}`}>
@@ -177,9 +188,16 @@ function PlayerCard({
                             ? 'border-gray-200 bg-gray-50 text-gray-700'
                             : 'border-dashed border-gray-300 bg-gray-50 text-gray-300'
                         }`}
-            title="Mål hämtas från iBIS efter matchen"
+            title={
+              okandPeriod
+                ? 'Spelaren har mål utan periodinformation. De räknas bara i hela matchen.'
+                : 'Mål hämtas från iBIS efter matchen'
+            }
           >
-            {malKnown ? malFromIbis : '–'}
+            {malKnown ? malForPeriod : '–'}
+            {okandPeriod && (
+              <span className="ml-0.5 font-normal text-gray-400">·</span>
+            )}
           </span>
         </span>
 
@@ -466,6 +484,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
       match={match}
       ownShots={countSide(events ?? [], 'egen', period)}
       oppShots={countSide(events ?? [], 'motstandare', period)}
+      period={period}
     />
   )
 
@@ -497,10 +516,18 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
   const totalCounts = countActive(events) // alltid hela matchen, för "Totalt"
   const oppCounts = countSide(events, 'motstandare', period) // motståndaren, vald period
   const osynkade = unsyncedCount(events)
-  const malById = new Map(trupp.map(p => [p.player_id, p.mal]))
   const filteredTrupp = sok.trim()
     ? trupp.filter(p => matchesPlayerQuery(p, sok))
     : trupp
+
+  // Saknas periodinformation för något mål säger vyn det rakt ut i periodläget
+  // (SPEC 6.7). Hellre en saknad siffra än en felaktig – men tränaren ska veta
+  // att siffran inte är hela sanningen.
+  const malSaknarPeriod =
+    !overview &&
+    (trupp.some(p => malTal(p, period).okant) ||
+      malTal(match, period).okant ||
+      motstandareMalTal(match, period).okant)
 
   return (
     <div>
@@ -580,6 +607,13 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
             <span className="font-semibold text-gray-700">period {period}</span>.
           </p>
         )}
+
+        {malSaknarPeriod && (
+          <p className="text-xs text-gray-500 mt-1.5">
+            Några mål saknar periodinformation i iBIS och räknas bara i hela
+            matchen. De är markerade med en prick.
+          </p>
+        )}
       </div>
 
       {/* Sökfält – filtrerar bara spelarlistan, motståndarblocket ligger alltid
@@ -636,7 +670,7 @@ export default function ShotRegistration({ match, offlineNotice, onUnauthed }) {
               player={p}
               counts={counts}
               totalCounts={totalCounts}
-              malFromIbis={malById.get(p.player_id)}
+              period={period}
               onPlus={handlePlus}
               onMinus={handleMinus}
               disabled={!name}

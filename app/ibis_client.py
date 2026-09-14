@@ -5,6 +5,7 @@ Hämtar token anonymt via /StatsAppApi/api/startkit innan varje session.
 Anrop är sekventiella med kort paus och retry med exponentiell backoff.
 """
 
+import re
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -176,6 +177,37 @@ class IBISLineups(BaseModel):
     AwayTeamPlayers: list[IBISMatchPlayer] = []
 
 
+# Matchhändelser. MatchEventTypeID är en odokumenterad enum; de två vi bryr oss
+# om är mål och utvisning. Resten (periodstart/slut, timeout, målvaktsbyten)
+# ignoreras.
+EVENT_GOAL = 1
+EVENT_PENALTY = 2
+
+
+class IBISMatchEvent(BaseModel):
+    MatchEventID: int
+    MatchEventTypeID: int
+    Period: int | None = None
+    Minute: int | None = None
+    Second: int | None = None
+    PlayerID: int | None = None
+    PlayerAssistID: int | None = None
+    PenaltyCode: str | None = None
+    PenaltyName: str | None = None
+
+    @field_validator(
+        "Period", "Minute", "Second", "PlayerID", "PlayerAssistID", mode="before",
+    )
+    @classmethod
+    def _opt_int(cls, v: Any) -> Any:
+        return _coerce_opt_int(v)
+
+    @field_validator("PenaltyCode", "PenaltyName", mode="before")
+    @classmethod
+    def _str_fields(cls, v: Any) -> Any:
+        return _coerce_str(v)
+
+
 # ---------------------------------------------------------------------------
 # Hjälpfunktioner
 # ---------------------------------------------------------------------------
@@ -244,6 +276,55 @@ def is_goalkeeper_player(player: "IBISMatchPlayer | IBISSquadPlayer") -> bool:
     if not pos:
         return False
     return pos in _GOALKEEPER_POSITIONS or "målvakt" in pos or "goalkeeper" in pos
+
+
+# Utvisningens längd finns inte som eget fält i Events – bara som text i
+# PenaltyName ("Slag, 2 min", "Hårt spel 2 min"). Minuterna läses därför ur
+# texten. Går det inte att läsa (t.ex. "Matchstraff 1") returneras None, och
+# minuterna hamnar som "okänd period" i stället för att gissas fel.
+_PENALTY_MINUTES_RE = re.compile(r"(\d+)\s*min", re.IGNORECASE)
+_ANY_NUMBER_RE = re.compile(r"\d+")
+
+
+def penalty_minutes_from_name(name: str | None) -> int | None:
+    """
+    Läser antal minuter ur PenaltyName. None när texten inte säger något.
+
+    Kravet är att texten innehåller exakt *ett* tal och att det talet följs av
+    "min". Det avvisar både "Matchstraff 1" (tal utan minuter) och
+    sammansatta utvisningar som "2+10 min", där ett enkelt uttryck skulle
+    plocka fel tal. En okänd längd räknas som okänd period i stället för att
+    gissas fel.
+    """
+    if not name:
+        return None
+    if len(_ANY_NUMBER_RE.findall(name)) != 1:
+        return None
+    found = _PENALTY_MINUTES_RE.findall(name)
+    if len(found) != 1:
+        return None
+    return int(found[0])
+
+
+def parse_match_events(raw_match: dict) -> list[IBISMatchEvent]:
+    """
+    Plockar ut mål- och utvisningshändelser ur ett rått matchobjekt.
+
+    Events är null i lag-endpointen och fylls först i /matches/{id} när matchen
+    spelats. Saknas de returneras en tom lista – anroparen får då ingen
+    periodinformation och ska räkna målen bara i "hela matchen".
+    """
+    events = raw_match.get("Events")
+    if not events:
+        return []
+    out: list[IBISMatchEvent] = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        if e.get("MatchEventTypeID") not in (EVENT_GOAL, EVENT_PENALTY):
+            continue
+        out.append(IBISMatchEvent.model_validate(e))
+    return out
 
 
 def get_team_players(lineups: IBISLineups, team_id: int) -> list[IBISMatchPlayer]:
@@ -322,3 +403,14 @@ class IBISClient:
     def fetch_lineups(self, match_id: int) -> IBISLineups:
         resp = self._get(f"matches/{match_id}/lineups")
         return IBISLineups.model_validate(resp.json())
+
+    def fetch_match_raw(self, match_id: int) -> dict:
+        """
+        Hämtar ett enskilt matchobjekt.
+
+        Behövs för Events[], som är null i lag-endpointen och bara fylls här.
+        Det är enda källan till vilken period ett mål eller en utvisning hör
+        till (SPEC 6.7).
+        """
+        resp = self._get(f"matches/{match_id}")
+        return resp.json()

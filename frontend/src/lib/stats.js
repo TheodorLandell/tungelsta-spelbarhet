@@ -32,10 +32,13 @@ export function beskrivOmfattning(omfattning, antalMatcher) {
   return `Senaste ${omfattning.n} · ${m}`
 }
 
-// Segmenten till den staplade skottbaren, i visningsordning. Tar spelarens
-// skott-objekt från svaret och returnerar [] om registrering saknas.
+// Segmenten till den staplade skottbaren, i visningsordning.
+//
+// Tre segment, inte fyra: ett mål är ett skott på mål, så målen ingår i
+// "På mål" och räknas aldrig separat i totalen (SPEC 7). Andelarna summerar
+// till 100 %. Målen visas i stället som eget värde tillsammans med
+// målprocenten, se malProcentText nedan.
 export const SKOTT_SEGMENT = [
-  { key: 'mal', label: 'Mål' },
   { key: 'pa_mal', label: 'På mål' },
   { key: 'utanfor', label: 'Utanför' },
   { key: 'i_tack', label: 'I täck' },
@@ -48,4 +51,15 @@ export function skottSegment(skott) {
     antal: skott[s.key]?.antal ?? 0,
     andel: skott[s.key]?.andel ?? null,
   }))
+}
+
+// Raden under skottbaren: mål och målprocent (mål delat med skott på mål).
+// Returnerar null när registrering saknas – då finns ingenting att visa.
+export function malProcentText(skott) {
+  if (!skott || !skott.registrerat) return null
+  const mal = skott.mal ?? 0
+  const procent = skott.malprocent
+  return procent == null
+    ? `${mal} mål av ${skott.pa_mal?.antal ?? 0} på mål`
+    : `${mal} mål av ${skott.pa_mal?.antal ?? 0} på mål (${procent} %)`
 }

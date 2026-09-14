@@ -5,8 +5,16 @@ Aggregerar per spelare, för ett lag och en vald omfattning:
 
   - Matcher: antal matcher i truppen inom omfattningen
   - Mål, assist, poäng, utvisningsminuter från iBIS-appearances
-  - Skott totalt = mål + på mål + utanför + i täck, samt de fyra andelarna
+  - Skott totalt = på mål + utanför + i täck, samt de tre andelarna
     (summerar alltid till 100)
+
+Ett mål är ett skott på mål. Mål registreras inte manuellt (SPEC 6.2), så
+``pa_mal`` är de registrerade skotten på mål **plus** målen från iBIS. Målen
+ingår därmed i totalen via på mål och räknas aldrig en gång till som en egen
+post – annars skulle varje mål räknas dubbelt.
+
+Mål visas fortfarande som eget värde, tillsammans med målprocenten: mål delat
+med skott på mål.
 
 Bara seriematcher räknas (SPEC 10: cup och träningsmatcher är utanför scope),
 och bara spelade matcher – en publicerad men ospelad trupp ger ingen statistik.
@@ -17,8 +25,8 @@ lag A eller B, så en spelares siffror hör till matchens lag (SPEC 7).
 Saknad data: skott finns bara för matcher där någon registrerat. En spelare vars
 matcher i omfattningen saknar registrering får tomma skottfält
 (``skott.registrerat = False``), aldrig noll – noll skott och ingen registrering
-är olika saker. Skottbreddningens "mål" räknas över samma matcher som skotten,
-så de fyra andelarna hänger ihop även när bara en del av matcherna är
+är olika saker. Målen som räknas in i ``pa_mal`` räknas över samma matcher som
+skotten, så andelarna hänger ihop även när bara en del av matcherna är
 registrerade.
 """
 
@@ -31,8 +39,9 @@ from app.roster import apply_roster_edits, roster_edits_for_matches
 SCOPES = ("senaste", "senaste_n", "sasong")
 
 # Skottkategorierna i visningsordning, med nyckeln som används i svaret.
+# De tre är hela totalen och summerar till 100 %. Mål ligger inne i "pa_mal"
+# och är alltså ingen egen post här.
 _SHOT_KEYS = (
-    ("mal", None),           # målandelen kommer från iBIS, inte shot_events
     ("pa_mal", "on_goal"),
     ("utanfor", "missed"),
     ("i_tack", "blocked"),
@@ -50,7 +59,7 @@ def _select_scope(match_ids: list[int], scope: str, n: int) -> list[int]:
 
 def _shares(parts: list[int], total: int) -> list[int | None]:
     """
-    Fyra heltalsandelar som summerar till exakt 100 (största rest-metoden).
+    Heltalsandelar som summerar till exakt 100 (största rest-metoden).
     Returnerar None för alla om det inte finns något att fördela.
     """
     if total <= 0:
@@ -144,17 +153,21 @@ def compute_stats(db: Session, team: str, scope: str, n: int = 5) -> dict:
                 for kind, c in shots.get((m, pid), {}).items():
                     counts[kind] += c
 
-            parts = [
-                skott_mal,
-                counts["on_goal"],
-                counts["missed"],
-                counts["blocked"],
-            ]
+            # Ett mål är ett skott på mål: målen läggs till de registrerade
+            # skotten på mål och räknas aldrig separat i totalen.
+            pa_mal = counts["on_goal"] + skott_mal
+            parts = [pa_mal, counts["missed"], counts["blocked"]]
             totalt = sum(parts)
             andelar = _shares(parts, totalt)
             skott = {
                 "registrerat": True,
                 "totalt": totalt,
+                "mal": skott_mal,
+                # Målprocent = mål delat med skott på mål. None när inget skott
+                # på mål finns att dela med.
+                "malprocent": (
+                    round(skott_mal * 100 / pa_mal) if pa_mal > 0 else None
+                ),
                 **{
                     key: {"antal": parts[i], "andel": andelar[i]}
                     for i, (key, _wire) in enumerate(_SHOT_KEYS)

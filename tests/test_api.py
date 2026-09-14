@@ -956,10 +956,14 @@ def _lineups(match_id, away_players, *, home_id=1977, away_id=17541):
     })
 
 
-def _fake_client(team_raw, lineups_by_id=None):
+def _fake_client(team_raw, lineups_by_id=None, events_by_id=None):
     client = MagicMock(spec=IBISClient)
     client.fetch_team_raw.return_value = team_raw
     client.fetch_lineups.side_effect = lambda mid: (lineups_by_id or {})[mid]
+    # Events är null i lag-endpointen och hämtas per match (SPEC 6.7).
+    client.fetch_match_raw.side_effect = lambda mid: {
+        "MatchID": mid, "Events": (events_by_id or {}).get(mid),
+    }
     return client
 
 
@@ -1020,8 +1024,19 @@ class TestGetLive:
         assert row["motstandare_mal"] == 2
         assert row["resultat"] == {"hemma": 2, "borta": 1}
         assert row["status"] == "played"
+        # Utan matchhändelser är perioden okänd: målet och minuterna räknas
+        # bara i hela matchen (SPEC 6.7).
         assert row["spelare"] == [
-            {"player_id": 10, "mal": 1, "assist": 0, "utvisningsminuter": 2},
+            {
+                "player_id": 10,
+                "mal": 1,
+                "mal_perioder": {"1": 0, "2": 0, "3": 0},
+                "mal_utan_period": 1,
+                "assist": 0,
+                "utvisningsminuter": 2,
+                "utv_perioder": {"1": 0, "2": 0, "3": 0},
+                "utv_utan_period": 2,
+            },
         ]
 
     def test_svaret_cachas_sa_flera_pollningar_ger_ett_ibis_anrop(self, db, api_client, monkeypatch):

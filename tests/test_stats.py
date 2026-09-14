@@ -245,11 +245,13 @@ class TestLagseparation:
 # ---------------------------------------------------------------------------
 
 class TestSkott:
-    def test_skott_totalt_och_andelar_summerar_till_100(self, client, db):
+    def test_mal_ingar_i_pa_mal_och_dubbelraknas_inte(self, client, db):
+        # Ett mål är ett skott på mål (SPEC 7). 2 mål + 4 registrerade skott på
+        # mål = 6 på mål. Totalen är 6 + 1 + 1 = 8, inte 10 – målen räknas bara
+        # en gång.
         add_match(db, 1, "A", datetime(2026, 9, 1))
         add_player(db, 10, "Kalle", "7")
         add_appearance(db, 1, 10, "Kalle", goals=2)
-        # 2 mål + 4 på mål + 1 utanför + 1 i täck = 8 totalt
         add_shot(db, "s1", 1, 10, "on_goal")
         add_shot(db, "s2", 1, 10, "on_goal")
         add_shot(db, "s3", 1, 10, "on_goal")
@@ -260,15 +262,39 @@ class TestSkott:
 
         skott = rows_by_id(client.get("/api/stats?team=A").json())[10]["skott"]
         assert skott["registrerat"] is True
-        assert skott["totalt"] == 8
-        assert skott["mal"]["antal"] == 2
-        assert skott["pa_mal"]["antal"] == 4
+        assert skott["pa_mal"]["antal"] == 6      # 4 registrerade + 2 mål
         assert skott["utanfor"]["antal"] == 1
         assert skott["i_tack"]["antal"] == 1
-        summa = sum(
-            skott[k]["andel"] for k in ("mal", "pa_mal", "utanfor", "i_tack")
+        assert skott["totalt"] == 8               # inte 10
+        assert skott["totalt"] == (
+            skott["pa_mal"]["antal"]
+            + skott["utanfor"]["antal"]
+            + skott["i_tack"]["antal"]
         )
-        assert summa == 100
+        # Mål visas som eget värde, utan att vara en egen post i totalen.
+        assert skott["mal"] == 2
+        assert skott["malprocent"] == 33          # 2 / 6
+
+    def test_de_tre_andelarna_summerar_till_100(self, client, db):
+        add_match(db, 1, "A", datetime(2026, 9, 1))
+        add_player(db, 10, "Kalle", "7")
+        add_appearance(db, 1, 10, "Kalle", goals=2)
+        add_shot(db, "s1", 1, 10, "on_goal")
+        add_shot(db, "s2", 1, 10, "on_goal")
+        add_shot(db, "s3", 1, 10, "on_goal")
+        add_shot(db, "s4", 1, 10, "on_goal")
+        add_shot(db, "s5", 1, 10, "missed")
+        add_shot(db, "s6", 1, 10, "blocked")
+        db.flush()
+
+        skott = rows_by_id(client.get("/api/stats?team=A").json())[10]["skott"]
+        andelar = [skott[k]["andel"] for k in ("pa_mal", "utanfor", "i_tack")]
+        assert sum(andelar) == 100
+        # 6/1/1 av 8 → 75 / 12,5 / 12,5. Största rest ger den udda procenten
+        # till den första av de två lika.
+        assert andelar == [75, 13, 12]
+        # Mål är ingen andel längre – bara ett värde.
+        assert not isinstance(skott["mal"], dict)
 
     def test_andelar_med_udda_fordelning_summerar_till_100(self, client, db):
         add_match(db, 1, "A", datetime(2026, 9, 1))
@@ -279,11 +305,23 @@ class TestSkott:
         db.flush()
 
         skott = rows_by_id(client.get("/api/stats?team=A").json())[10]["skott"]
-        # 1/1/1/0 av 3 → 33/33/34/0 (största rest)
+        # 2 på mål (1 registrerat + 1 mål), 1 utanför, 0 i täck av 3 → 67/33/0
         assert skott["totalt"] == 3
-        andelar = [skott[k]["andel"] for k in ("mal", "pa_mal", "utanfor", "i_tack")]
+        andelar = [skott[k]["andel"] for k in ("pa_mal", "utanfor", "i_tack")]
         assert sum(andelar) == 100
-        assert sorted(andelar) == [0, 33, 33, 34]
+        assert andelar == [67, 33, 0]
+
+    def test_malprocent_ar_none_utan_skott_pa_mal(self, client, db):
+        add_match(db, 1, "A", datetime(2026, 9, 1))
+        add_player(db, 10, "Kalle", "7")
+        add_appearance(db, 1, 10, "Kalle", goals=0)
+        add_shot(db, "s1", 1, 10, "missed")
+        db.flush()
+
+        skott = rows_by_id(client.get("/api/stats?team=A").json())[10]["skott"]
+        assert skott["pa_mal"]["antal"] == 0
+        assert skott["mal"] == 0
+        assert skott["malprocent"] is None
 
     def test_ingen_registrering_ger_tomma_skottfalt_inte_noll(self, client, db):
         add_match(db, 1, "A", datetime(2026, 9, 1))
@@ -310,8 +348,10 @@ class TestSkott:
         row = rows_by_id(client.get("/api/stats?team=A").json())[10]
         assert row["mal"] == 6  # toppsiffran över hela omfattningen
         assert row["skott"]["registrerat"] is True
-        assert row["skott"]["mal"]["antal"] == 1  # bara match 1
-        assert row["skott"]["totalt"] == 2  # 1 mål + 1 på mål
+        assert row["skott"]["mal"] == 1  # bara match 1
+        # 1 registrerat skott på mål + 1 mål = 2 på mål, som är hela totalen
+        assert row["skott"]["pa_mal"]["antal"] == 2
+        assert row["skott"]["totalt"] == 2
 
     def test_tombstonad_skotthandelse_raknas_inte(self, client, db):
         add_match(db, 1, "A", datetime(2026, 9, 1))
@@ -353,8 +393,9 @@ class TestSkott:
         skott = rows_by_id(client.get("/api/stats?team=A").json())[10]["skott"]
         assert skott["registrerat"] is True
         assert skott["totalt"] == 0
-        assert skott["mal"]["antal"] == 0
-        assert skott["mal"]["andel"] is None
+        assert skott["mal"] == 0
+        assert skott["malprocent"] is None
+        assert skott["pa_mal"]["andel"] is None
 
 
 # ---------------------------------------------------------------------------

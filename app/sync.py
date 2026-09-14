@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.ibis_client import (
+    EVENT_GOAL,
     IBISClient,
     IBISMatch,
     IBISMatchPlayer,
@@ -24,8 +25,18 @@ from app.ibis_client import (
     is_goalkeeper_player,
     is_played,
     parse_kickoff,
+    parse_match_events,
+    penalty_minutes_from_name,
 )
-from app.models import Appearance, Base, Match, Player, PlayerTeam, SyncLog
+from app.models import (
+    Appearance,
+    Base,
+    Match,
+    MatchEvent,
+    Player,
+    PlayerTeam,
+    SyncLog,
+)
 
 STOCKHOLM = timezone(timedelta(hours=2))
 
@@ -216,6 +227,57 @@ def _save_appearances(
             existing.penalty_minutes = penalty_minutes
 
 
+def _save_match_events(
+    db: Session,
+    match_id: int,
+    raw_match: dict,
+    own_player_ids: set[int],
+) -> int:
+    """
+    Sparar mål- och utvisningshändelser för våra egna spelare (SPEC 6.7).
+
+    Bara händelser vi kan knyta till en spelare i truppen sparas – motståndarnas
+    mål per period kommer från IntermediateResults i matchens raw, inte härifrån.
+
+    Gamla rader för matchen rensas först, så att en rättelse i iBIS (borttagen
+    eller ändrad händelse) slår igenom i stället för att ligga kvar. Returnerar
+    antalet sparade händelser.
+    """
+    events = parse_match_events(raw_match)
+    if not events:
+        # iBIS har inte publicerat händelserna än. Rör inget – det som eventuellt
+        # redan finns är bättre än att tömma tabellen.
+        return 0
+
+    for row in db.scalars(
+        select(MatchEvent).where(MatchEvent.match_id == match_id)
+    ).all():
+        db.delete(row)
+    db.flush()
+
+    saved = 0
+    for e in events:
+        if e.PlayerID is None or e.PlayerID not in own_player_ids:
+            continue
+        is_goal = e.MatchEventTypeID == EVENT_GOAL
+        assist = e.PlayerAssistID or None
+        db.add(MatchEvent(
+            match_event_id=e.MatchEventID,
+            match_id=match_id,
+            kind="goal" if is_goal else "penalty",
+            period=e.Period,
+            player_id=e.PlayerID,
+            assist_player_id=assist if is_goal else None,
+            penalty_minutes=(
+                None if is_goal else penalty_minutes_from_name(e.PenaltyName)
+            ),
+            minute=e.Minute,
+            second=e.Second,
+        ))
+        saved += 1
+    return saved
+
+
 def _sync_one_match(
     db: Session,
     client: IBISClient,
@@ -234,7 +296,7 @@ def _sync_one_match(
     matchen över och synken fortsätter med nästa.
     """
     raw = raw_by_match.get(match.MatchID, match.model_dump(mode="json"))
-    _db_match, is_new = _upsert_match(
+    db_match, is_new = _upsert_match(
         db, match, team_label, team_id, raw,
         counts_for_rules=counts_for_rules,
     )
@@ -258,11 +320,20 @@ def _sync_one_match(
     # app/status.py – sync.py sparar bara underlaget.
     kickoff = parse_kickoff(match.MatchDateTime).replace(tzinfo=None)
 
-    # En färdigrapporterad match som redan har appearances hämtas inte om
-    # (SPEC 3.5). Allt annat hämtas: matcher utan appearances, och spelade
-    # matcher som ännu inte är färdigrapporterade – så statistiken hålls färsk
-    # om sekretariatet rättar något i efterhand.
-    if match.FinalResultCreatedTS and _has_appearances(db, match.MatchID):
+    # En färdigrapporterad match hämtas inte om (SPEC 3.5) – men bara om
+    # statistiken faktiskt hämtades *efter* att slutresultatet rapporterades.
+    #
+    # Trupper publiceras före matchstart, så appearances skrivs redan före och
+    # under matchen. En spelare som får sin andra utvisning i period 3 hann då
+    # sparas med halva antalet minuter. Den gamla regeln såg bara att det fanns
+    # appearances och frös de siffrorna för alltid. Genom att jämföra mot
+    # stats_final_ts hämtas matchen om en gång efter slutrapporten, och igen om
+    # sekretariatet rättar resultatet i efterhand.
+    if (
+        match.FinalResultCreatedTS
+        and db_match.stats_final_ts == match.FinalResultCreatedTS
+        and _has_appearances(db, match.MatchID)
+    ):
         return is_new
 
     # Kommande matcher: trupper publiceras inte tidigare än sju dagar före
@@ -275,6 +346,18 @@ def _sync_one_match(
     lineups = client.fetch_lineups(match.MatchID)
     players = get_team_players(lineups, team_id)
     _save_appearances(db, match.MatchID, players, kickoff)
+
+    # Matchhändelserna ger perioden för varje mål och utvisning (SPEC 6.7).
+    # Events är null i lag-endpointen, så matchobjektet måste hämtas separat –
+    # men bara för spelade matcher, där det finns något att hämta.
+    if is_played(match):
+        raw_match = client.fetch_match_raw(match.MatchID)
+        _save_match_events(
+            db, match.MatchID, raw_match, {p.PlayerID for p in players}
+        )
+
+    # Stämpla vad statistiken bygger på, så nästa synk vet om den är färdig.
+    db_match.stats_final_ts = match.FinalResultCreatedTS
     return is_new
 
 
