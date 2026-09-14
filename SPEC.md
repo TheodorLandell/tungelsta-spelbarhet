@@ -150,6 +150,43 @@ Ett jobb en gång per dygn, plus en manuell "Uppdatera"-knapp.
 Sekventiella anrop med kort paus. Färdigrapporterade matcher hämtas inte om –
 men bara när statistiken hämtades efter slutrapporten, se 6.7.
 
+### 3.6 Tröjnummer och lagtillhörighet
+
+**Två källor skriver samma fält.** Tröjnummer kommer både från lagets
+`Players[]` och från matchernas `lineups`. De är inte likvärdiga:
+
+| Källa | Vad den är | Vikt |
+|-------|-----------|------|
+| `lineups` | En **observation** – vad spelaren faktiskt bar i en match | Stämplas med matchens kickoff i `players.shirt_seen`. Nyast vinner |
+| `Players[]` | En **registrering** som kan ligga efter verkligheten | Får skriva bara när lagen är överens |
+
+Utan regler tar de ut varandra. Synken kör lag A helt och därefter lag B, så den
+sista skrivningen vann – i praktiken lag B:s registrering, även när lag A och
+den senast spelade matchen var överens om ett annat nummer.
+
+Reglerna:
+
+- **Null och tom sträng skriver aldrig över ett befintligt nummer.** Varken från
+  lineups eller från lagtruppen.
+- **En lineup skriver numret bara om matchen är minst lika ny** som den som satte
+  det nuvarande numret. Matcher synkas inte i datumordning, så utan den regeln
+  kan en gammal match skriva över en ny.
+- **Lagtruppens nummer skrivs när de lag som listar spelaren är överens.** Sju–åtta
+  spelare står i båda trupperna, och iBIS håller numret per lag. Säger lagen olika
+  har den ena listan slutat stämma – då behålls numret från den senaste
+  matchtruppen, och konflikten loggas som en varning i synken.
+- Numret från lagtruppen stämplas med synktidpunkten, så bara en match som spelas
+  därefter kan ändra det.
+
+**Lagtillhörighet.** `player_teams` är unionen av två källor: lagets `Players[]`
+och spelare med en appearance i en av lagets matcher. Den som inte längre finns i
+någondera **tas bort ur laget**.
+
+Spelaren själv rörs aldrig – bara raden i `player_teams` försvinner. Han ligger
+kvar i `players` med sitt namn och nummer, och hans appearances, skott och
+låsstatus är orörda. Har han spelat för laget ligger han dessutom kvar i
+lagtillhörigheten: han *har* tillhört det.
+
 ---
 
 ## 4. Datamodell
@@ -195,6 +232,8 @@ players
   player_id         PK
   name
   shirt_no
+  shirt_seen        datetime, när shirt_no observerades i en matchtrupp.
+                    null = numret kommer från lagtruppen, inte en lineup (3.6)
   is_goalkeeper     bool
   last_seen
 
@@ -520,8 +559,21 @@ skott.
 
 Mål i en period utan registrerade motståndarskott, och mål utan period (6.7),
 tillskrivs ingen målvakt alls. Samma regel som för övrigt: hellre en saknad
-siffra än en felaktig. Motståndarskott registrerade innan målvaktsvalet fanns har
+siffra än en felaktig.
+
+**Backfill.** Motståndarskott registrerade innan målvaktsvalet fanns har
 `goalkeeper_id = null` och räknas inte in i någon målvakts statistik.
+`python -m app.backfill_goalkeeper` fyller i dem, men bara där det går utan
+gissning:
+
+- Matchens effektiva trupp (inklusive roster_edits) har **exakt en** målvakt →
+  alla motståndarskott utan målvakt tillskrivs honom
+- Flera målvakter, eller ingen → lämnas null
+- Våra egna skott rörs aldrig
+
+Kommandot skriver ut hur många skott som tilldelades och hur många som lämnades,
+per match och med beslutet. `--dry-run` visar utfallet utan att skriva. Det är
+idempotent – skott som redan har en målvakt plockas aldrig upp.
 
 ---
 

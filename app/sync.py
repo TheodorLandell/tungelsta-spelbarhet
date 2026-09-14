@@ -120,35 +120,24 @@ def _upsert_match(
     return existing, False
 
 
+def _clean_shirt(value: str | None) -> str | None:
+    """Tomt tröjnummer är detsamma som inget. Aldrig '' i databasen."""
+    if value is None:
+        return None
+    s = value.strip()
+    return s or None
+
+
 def _upsert_player(db: Session, p: IBISMatchPlayer, kickoff: datetime) -> None:
-    is_gk = is_goalkeeper_player(p)
-    has_position = bool((p.Position or "").strip())
-    existing = db.get(Player, p.PlayerID)
-    if existing is None:
-        db.add(Player(
-            player_id=p.PlayerID,
-            name=p.Name,
-            shirt_no=p.ShirtNo,
-            is_goalkeeper=is_gk,
-            last_seen=kickoff,
-        ))
-    else:
-        existing.name = p.Name
-        if p.ShirtNo is not None:
-            existing.shirt_no = p.ShirtNo
-        # Uppdatera bara målvaktsmarkeringen när lineupen faktiskt har
-        # positionsdata – annars skulle en tom position nolla en tidigare
-        # känd målvakt.
-        if has_position:
-            existing.is_goalkeeper = is_gk
-        if kickoff > existing.last_seen:
-            existing.last_seen = kickoff
+    """
+    Sparar en spelare utifrån en matchtrupp.
 
-
-def _upsert_squad_player(db: Session, p: IBISSquadPlayer, sync_at: datetime) -> None:
-    """Sparar en trupp-spelare som ännu inte förekommer i någon lineup."""
-    # ShirtNo är redan normaliserad till str | None av modellen.
-    shirt = p.ShirtNo
+    Lineupen är en *observation*: så här såg det ut i den här matchen. Numret
+    skrivs därför bara om matchen är minst lika ny som den som satte det
+    nuvarande numret – annars kunde en gammal match skriva över ett nyare
+    nummer, eftersom matcherna inte synkas i datumordning (SPEC 3.6).
+    """
+    shirt = _clean_shirt(p.ShirtNo)
     is_gk = is_goalkeeper_player(p)
     has_position = bool((p.Position or "").strip())
     existing = db.get(Player, p.PlayerID)
@@ -157,15 +146,127 @@ def _upsert_squad_player(db: Session, p: IBISSquadPlayer, sync_at: datetime) -> 
             player_id=p.PlayerID,
             name=p.Name,
             shirt_no=shirt,
+            shirt_seen=kickoff if shirt is not None else None,
+            is_goalkeeper=is_gk,
+            last_seen=kickoff,
+        ))
+        return
+
+    existing.name = p.Name
+    # Null får aldrig skriva över ett befintligt nummer (SPEC 3.6).
+    if shirt is not None and (
+        existing.shirt_seen is None or kickoff >= existing.shirt_seen
+    ):
+        existing.shirt_no = shirt
+        existing.shirt_seen = kickoff
+    # Uppdatera bara målvaktsmarkeringen när lineupen faktiskt har
+    # positionsdata – annars skulle en tom position nolla en tidigare
+    # känd målvakt.
+    if has_position:
+        existing.is_goalkeeper = is_gk
+    if kickoff > existing.last_seen:
+        existing.last_seen = kickoff
+
+
+def _upsert_squad_player(db: Session, p: IBISSquadPlayer, sync_at: datetime) -> None:
+    """
+    Sparar en spelare ur lagets Players[].
+
+    Tröjnumret skrivs *inte* här. Lagtruppen är en registrering som kan ligga
+    efter verkligheten, och en spelare kan dessutom stå i båda lagens trupper
+    med olika nummer. Numren samlas in och avgörs i stället samlat när båda
+    lagen är hämtade, se _resolve_squad_shirts.
+    """
+    shirt = _clean_shirt(p.ShirtNo)
+    is_gk = is_goalkeeper_player(p)
+    has_position = bool((p.Position or "").strip())
+    existing = db.get(Player, p.PlayerID)
+    if existing is None:
+        db.add(Player(
+            player_id=p.PlayerID,
+            name=p.Name,
+            shirt_no=shirt,
+            shirt_seen=None,      # inte observerat i någon match ännu
             is_goalkeeper=is_gk,
             last_seen=sync_at,
         ))
     else:
         existing.name = p.Name
-        if shirt is not None:
-            existing.shirt_no = shirt
         if has_position:
             existing.is_goalkeeper = is_gk
+
+
+def _resolve_squad_shirts(
+    db: Session,
+    squad_shirts: dict[int, dict[str, str]],
+    sync_at: datetime,
+    warnings: list[str],
+) -> None:
+    """
+    Skriver tröjnummer från lagtrupperna, när de går att lita på (SPEC 3.6).
+
+    Sju–åtta spelare står i båda lagens trupper, och iBIS håller numret per lag.
+    Säger lagen olika har den ena listan slutat stämma – då är det säkrare att
+    behålla numret spelaren faktiskt bar i sin senaste match än att låta det lag
+    som råkar synkas sist vinna.
+
+      - Ett lag listar spelaren, eller alla är överens → skriv numret
+      - Lagen säger olika → skriv inte, behåll lineupens observation, varna
+
+    Numret stämplas med synktidpunkten, så att bara en match som spelas därefter
+    kan ändra det. Null och tomma nummer är redan bortsorterade.
+    """
+    for player_id, per_team in squad_shirts.items():
+        varden = {shirt for shirt in per_team.values() if shirt is not None}
+        if not varden:
+            continue
+
+        if len(varden) > 1:
+            lag = ", ".join(
+                f"{team}={shirt}" for team, shirt in sorted(per_team.items())
+            )
+            warnings.append(
+                f"Spelare {player_id}: lagen anger olika tröjnummer ({lag}) – "
+                "behåller numret från senaste matchtruppen"
+            )
+            continue
+
+        player = db.get(Player, player_id)
+        if player is None:
+            continue
+        player.shirt_no = varden.pop()
+        player.shirt_seen = sync_at
+
+
+def _prune_player_teams(
+    db: Session, team_label: str, squad_ids: set[int]
+) -> int:
+    """
+    Tar bort lagtillhörigheter som inte längre finns i iBIS (SPEC 3.6).
+
+    Laget behåller unionen av två källor: lagets Players[] och spelare med en
+    appearance i en av lagets matcher. En spelare som plockats ur truppen men
+    har spelat för laget ligger kvar – han *har* tillhört laget.
+
+    Bara raden i player_teams försvinner. Spelaren, hans appearances, skott och
+    låsstatus rörs aldrig. Returnerar antalet borttagna rader.
+    """
+    spelat = set(db.scalars(
+        select(Appearance.player_id)
+        .join(Match, Match.match_id == Appearance.match_id)
+        .where(Match.team == team_label)
+        .distinct()
+    ).all())
+    behall = squad_ids | spelat
+
+    borttagna = 0
+    for row in db.scalars(
+        select(PlayerTeam).where(PlayerTeam.team == team_label)
+    ).all():
+        if row.player_id not in behall:
+            db.delete(row)
+            borttagna += 1
+    return borttagna
 
 
 def _upsert_player_team(db: Session, player_id: int, team_label: str) -> None:
@@ -379,6 +480,9 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
 
     warnings: list[str] = []
     matches_added = 0
+    # player_id -> {lag: tröjnummer} från lagens Players[]. Avgörs samlat när
+    # båda lagen är hämtade, eftersom en spelare kan stå i båda trupperna.
+    squad_shirts: dict[int, dict[str, str]] = {}
 
     try:
         for team_label, team_id in (("A", settings.team_a_id), ("B", settings.team_b_id)):
@@ -421,10 +525,33 @@ def run_sync(db: Session, client: IBISClient) -> SyncResult:
             for squad_player in team.Players:
                 _upsert_squad_player(db, squad_player, squad_at)
                 _upsert_player_team(db, squad_player.PlayerID, team_label)
+                shirt = _clean_shirt(squad_player.ShirtNo)
+                if shirt is not None:
+                    squad_shirts.setdefault(squad_player.PlayerID, {})[
+                        team_label
+                    ] = shirt
 
             # Lagtillhörighet: unionen av trupp-listan (ovan) och spelade matcher
             db.flush()
             _sync_player_teams(db, team_label)
+
+            # …och bara den unionen. En spelare som plockats ur truppen i iBIS
+            # och aldrig spelat för laget ska inte ligga kvar (SPEC 3.6).
+            db.flush()
+            borttagna = _prune_player_teams(
+                db, team_label, {p.PlayerID for p in team.Players}
+            )
+            if borttagna:
+                warnings.append(
+                    f"Lag {team_label}: {borttagna} "
+                    f"{'spelare' if borttagna == 1 else 'spelare'} borttagna ur "
+                    "lagtruppen (finns kvar med sin historik)"
+                )
+
+        # Tröjnummer från lagtrupperna avgörs när båda lagen är hämtade, så att
+        # lagen inte skriver över varandra (SPEC 3.6).
+        db.flush()
+        _resolve_squad_shirts(db, squad_shirts, _now_naive(), warnings)
 
         log.ok = True
 

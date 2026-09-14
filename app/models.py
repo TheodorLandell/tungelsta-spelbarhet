@@ -60,6 +60,11 @@ class Player(Base):
     player_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128))
     shirt_no: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # När shirt_no observerades i en matchtrupp. Tröjnummer kommer från två
+    # källor – lagets Players[] och matchernas lineups – och utan en stämpel
+    # kan en äldre match skriva över en nyare (SPEC 3.6). Null = numret kommer
+    # inte från någon lineup.
+    shirt_seen: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     is_goalkeeper: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     last_seen: Mapped[datetime] = mapped_column(DateTime)
 
