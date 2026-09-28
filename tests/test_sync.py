@@ -807,16 +807,28 @@ class TestAppearanceStats:
         return make_match_dict(match_id, goals_home=3, goals_away=2,
                                final_result_ts="2020-01-15T21:00:00")
 
-    def test_ny_appearance_far_statistik_fran_lineups(self, db, monkeypatch):
+    def test_ny_appearance_far_statistik_fran_events(self, db, monkeypatch):
+        """
+        Lineups har inte längre Goals/Assists/PenaltyMinutes, så siffrorna
+        räknas ur matchens Events: Kalle gör två mål, lägger fram till Lisas
+        mål och sitter av två minuter.
+        """
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
 
         m = self._played_match(5001)
         lineups = make_lineups_dict(5001, away_players=[
-            make_player_dict(42, "Kalle", "7", goals=2, assists=1, penalty_minutes=2),
+            make_player_dict(42, "Kalle", "7"),
+            make_player_dict(43, "Lisa", "8"),
         ])
         client = build_client(
             team_a_dict=make_team_dict(TEAM_A_ID, [m]),
             lineups_by_id={5001: lineups},
+            events_by_id={5001: [
+                make_event_dict(1, 1, 1, 42),
+                make_event_dict(2, 1, 2, 42),
+                make_event_dict(3, 1, 3, 43, assist_id=42),
+                make_event_dict(4, 2, 2, 42, penalty_name="Slag, 2 min"),
+            ]},
         )
 
         assert run_sync(db, client).ok is True
@@ -825,6 +837,7 @@ class TestAppearanceStats:
         assert app.goals == 2
         assert app.assists == 1
         assert app.penalty_minutes == 2
+        assert db.get(Appearance, (5001, 43)).goals == 1
 
     def test_saknad_statistik_blir_noll(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
@@ -856,11 +869,17 @@ class TestAppearanceStats:
 
         m = make_match_dict(5003, goals_home=2, goals_away=1)  # inget final_result_ts
         lineups = make_lineups_dict(5003, away_players=[
-            make_player_dict(44, "Kalle", "7", goals=1, assists=2, penalty_minutes=0),
+            make_player_dict(44, "Kalle", "7"),
+            make_player_dict(47, "Lisa", "8"),
         ])
         client = build_client(
             team_a_dict=make_team_dict(TEAM_A_ID, [m]),
             lineups_by_id={5003: lineups},
+            events_by_id={5003: [
+                make_event_dict(1, 1, 1, 44),
+                make_event_dict(2, 1, 2, 47, assist_id=44),
+                make_event_dict(3, 1, 3, 47, assist_id=44),
+            ]},
         )
 
         assert run_sync(db, client).ok is True
@@ -869,6 +888,39 @@ class TestAppearanceStats:
         app = db.get(Appearance, (5003, 44))
         assert app.goals == 1
         assert app.assists == 2
+
+    def test_opublicerade_events_nollar_inte_befintlig_statistik(self, db, monkeypatch):
+        """
+        Events är enda källan till statistiken, och är null tills iBIS
+        publicerat händelserna. Då ska tidigare sparade siffror stå kvar –
+        att skriva nollor över riktiga mål vore sämre än att vänta.
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        db.add(Match(match_id=5006, team="A", competition_id=100,
+                     kickoff=datetime(2020, 1, 15, 19), status="played", raw={},
+                     stats_final_ts=None))
+        db.add(Player(player_id=48, name="Kalle", last_seen=datetime(2020, 1, 15, 19)))
+        db.add(Appearance(match_id=5006, player_id=48, player_name="Kalle",
+                          goals=3, assists=1, penalty_minutes=2))
+        db.flush()
+
+        m = self._played_match(5006)
+        lineups = make_lineups_dict(5006, away_players=[
+            make_player_dict(48, "Kalle", "7"),
+        ])
+        # Inga events_by_id: fetch_match_raw svarar med Events = null.
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={5006: lineups},
+        )
+
+        assert run_sync(db, client).ok is True
+
+        app = db.get(Appearance, (5006, 48))
+        assert app.goals == 3
+        assert app.assists == 1
+        assert app.penalty_minutes == 2
 
     def test_fardigrapporterad_match_med_appearances_hamtas_inte_om(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
@@ -910,11 +962,15 @@ class TestAppearanceStats:
 
         m = self._played_match(5005)
         lineups = make_lineups_dict(5005, away_players=[
-            make_player_dict(46, "Joacim", penalty_minutes=4),
+            make_player_dict(46, "Joacim"),
         ])
         client = build_client(
             team_a_dict=make_team_dict(TEAM_A_ID, [m]),
             lineups_by_id={5005: lineups},
+            events_by_id={5005: [
+                make_event_dict(1, 2, 1, 46, penalty_name="Slag, 2 min"),
+                make_event_dict(2, 2, 3, 46, penalty_name="Hårt spel 2 min"),
+            ]},
         )
 
         assert run_sync(db, client).ok is True

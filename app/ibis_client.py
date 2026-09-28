@@ -7,13 +7,20 @@ Anrop är sekventiella med kort paus och retry med exponentiell backoff.
 
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, field_validator
 
-BASE_URL = "https://api.innebandy.se/v2/api"
+from app.config import settings
+
+# Bas-URL:en kommer från konfigurationen (IBIS_BASE_URL). iBIS har flyttat
+# endpointerna en gång – den gamla sökvägen utan /public/ svarar nu 403 på
+# samtliga anrop – så nästa flytt ska bara kräva en miljövariabel. Eventuellt
+# avslutande snedstreck tas bort, för _get lägger på ett eget.
+BASE_URL = settings.ibis_base_url.rstrip("/")
 STARTKIT_URL = "https://api.innebandy.se/StatsAppApi/api/startkit"
 STATS_ORIGIN = "https://stats.innebandy.se"
 
@@ -170,11 +177,27 @@ class IBISTeam(BaseModel):
 
 
 class IBISLineups(BaseModel):
-    MatchID: int
-    HomeTeamID: int
-    AwayTeamID: int
+    # Lineup-svaret under /v2/api/public har bara de två spelararrayerna kvar:
+    # MatchID, HomeTeamID och AwayTeamID är borta, och per spelare saknas
+    # Goals, Assists, PenaltyMinutes och Position. Fälten är därför valfria –
+    # vilken array som är vår avgörs numera av matchobjektet (get_team_players
+    # med is_home) och statistiken räknas ur Events (player_stats_from_events).
+    MatchID: int | None = None
+    HomeTeamID: int | None = None
+    AwayTeamID: int | None = None
     HomeTeamPlayers: list[IBISMatchPlayer] = []
     AwayTeamPlayers: list[IBISMatchPlayer] = []
+
+    @field_validator("HomeTeamPlayers", "AwayTeamPlayers", mode="before")
+    @classmethod
+    def _players_list(cls, v: Any) -> Any:
+        """En trupp som inte publicerats kommer som null, inte som tom lista.
+
+        Gäller en sida i taget: en match kan ha hemmalagets trupp uppe men inte
+        bortalagets. Utan normalisering avbryts hela matchen på ett fel som
+        egentligen bara betyder "inget publicerat än".
+        """
+        return [] if v is None else v
 
 
 # Matchhändelser. MatchEventTypeID är en odokumenterad enum; de två vi bryr oss
@@ -327,13 +350,73 @@ def parse_match_events(raw_match: dict) -> list[IBISMatchEvent]:
     return out
 
 
-def get_team_players(lineups: IBISLineups, team_id: int) -> list[IBISMatchPlayer]:
-    """Väljer rätt spelararray baserat på om laget är hemma eller borta."""
-    if lineups.HomeTeamID == team_id:
+@dataclass
+class PlayerMatchStats:
+    """Mål, assist och utvisningsminuter för en spelare i en match."""
+    goals: int = 0
+    assists: int = 0
+    penalty_minutes: int = 0
+
+
+def player_stats_from_events(
+    raw_match: dict, own_player_ids: set[int]
+) -> dict[int, PlayerMatchStats] | None:
+    """
+    Räknar mål, assist och utvisningsminuter per spelare ur matchens Events.
+
+    Lineups hade tidigare siffrorna per spelare, men under /v2/api/public är
+    Goals, Assists och PenaltyMinutes borta ur svaret. Events är därför enda
+    källan (SPEC 3.3). Bara våra egna spelare räknas – PlayerID är unikt, så
+    motståndarnas händelser faller bort av sig själva.
+
+    Returnerar None när Events är null, alltså när iBIS inte publicerat
+    händelserna än. Då vet vi ingenting, och tidigare sparade siffror ska stå
+    kvar hellre än att nollas. En tom lista är däremot ett riktigt svar: 0-0
+    i en match som just börjat.
+
+    Varning: utvisningsminuter utan läsbar längd i PenaltyName (t.ex.
+    "Matchstraff 1") räknas som 0 minuter, eftersom minuterna inte finns som
+    eget fält. Tidigare kom totalen färdigsummerad från iBIS.
+    """
+    if raw_match.get("Events") is None:
+        return None
+    stats = {pid: PlayerMatchStats() for pid in own_player_ids}
+    for e in parse_match_events(raw_match):
+        if e.MatchEventTypeID == EVENT_GOAL:
+            if e.PlayerID in stats:
+                stats[e.PlayerID].goals += 1
+            if e.PlayerAssistID in stats:
+                stats[e.PlayerAssistID].assists += 1
+        elif e.MatchEventTypeID == EVENT_PENALTY and e.PlayerID in stats:
+            stats[e.PlayerID].penalty_minutes += (
+                penalty_minutes_from_name(e.PenaltyName) or 0
+            )
+    return stats
+
+
+def get_team_players(
+    lineups: IBISLineups,
+    team_id: int,
+    *,
+    is_home: bool | None = None,
+) -> list[IBISMatchPlayer]:
+    """
+    Väljer rätt spelararray baserat på om laget är hemma eller borta.
+
+    Lineup-svaret innehåller inte längre HomeTeamID/AwayTeamID, så sidan måste
+    komma från matchobjektet via is_home. Har svaret ID:na kvar avgörs sidan av
+    dem som tidigare, så äldre sparade svar fungerar fortfarande.
+    """
+    if is_home is not None:
+        return lineups.HomeTeamPlayers if is_home else lineups.AwayTeamPlayers
+    if lineups.HomeTeamID is not None and lineups.HomeTeamID == team_id:
         return lineups.HomeTeamPlayers
-    if lineups.AwayTeamID == team_id:
+    if lineups.AwayTeamID is not None and lineups.AwayTeamID == team_id:
         return lineups.AwayTeamPlayers
-    raise ValueError(f"TeamID {team_id} finns varken som hemma ({lineups.HomeTeamID}) eller borta ({lineups.AwayTeamID})")
+    raise ValueError(
+        f"TeamID {team_id} finns varken som hemma ({lineups.HomeTeamID}) eller "
+        f"borta ({lineups.AwayTeamID}) – saknar svaret ID:na måste is_home anges"
+    )
 
 
 # ---------------------------------------------------------------------------

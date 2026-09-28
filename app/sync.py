@@ -20,6 +20,7 @@ from app.ibis_client import (
     IBISMatchPlayer,
     IBISSquadPlayer,
     IBISTeam,
+    PlayerMatchStats,
     get_team_players,
     is_date_missing,
     is_goalkeeper_player,
@@ -27,6 +28,7 @@ from app.ibis_client import (
     parse_kickoff,
     parse_match_events,
     penalty_minutes_from_name,
+    player_stats_from_events,
 )
 from app.models import (
     Appearance,
@@ -304,12 +306,19 @@ def _save_appearances(
     match_id: int,
     players: list[IBISMatchPlayer],
     kickoff: datetime,
+    stats: dict[int, PlayerMatchStats] | None = None,
 ) -> None:
+    """
+    Sparar en appearance per spelare i truppen, med statistiken från Events.
+
+    stats är None när iBIS inte publicerat matchens händelser än (och för
+    matcher som inte spelats). Då lämnas siffrorna orörda: en befintlig rad
+    behåller vad den har, en ny rad får nollor tills händelserna finns. Att
+    skriva nollor över riktiga siffror vore sämre än att vänta.
+    """
     for p in players:
         _upsert_player(db, p, kickoff)
-        goals = p.Goals or 0
-        assists = p.Assists or 0
-        penalty_minutes = p.PenaltyMinutes or 0
+        s = stats.get(p.PlayerID) if stats is not None else None
         existing = db.get(Appearance, (match_id, p.PlayerID))
         if existing is None:
             db.add(Appearance(
@@ -317,15 +326,15 @@ def _save_appearances(
                 player_id=p.PlayerID,
                 player_name=p.Name,
                 shirt_no=p.ShirtNo,
-                goals=goals,
-                assists=assists,
-                penalty_minutes=penalty_minutes,
+                goals=s.goals if s else 0,
+                assists=s.assists if s else 0,
+                penalty_minutes=s.penalty_minutes if s else 0,
             ))
-        else:
+        elif s is not None:
             # Befintlig appearance: uppdatera statistiken från iBIS.
-            existing.goals = goals
-            existing.assists = assists
-            existing.penalty_minutes = penalty_minutes
+            existing.goals = s.goals
+            existing.assists = s.assists
+            existing.penalty_minutes = s.penalty_minutes
 
 
 def _save_match_events(
@@ -445,17 +454,27 @@ def _sync_one_match(
         return is_new
 
     lineups = client.fetch_lineups(match.MatchID)
-    players = get_team_players(lineups, team_id)
-    _save_appearances(db, match.MatchID, players, kickoff)
+    players = get_team_players(
+        lineups, team_id, is_home=match.HomeTeamID == team_id
+    )
+    own_player_ids = {p.PlayerID for p in players}
 
-    # Matchhändelserna ger perioden för varje mål och utvisning (SPEC 6.7).
-    # Events är null i lag-endpointen, så matchobjektet måste hämtas separat –
-    # men bara för spelade matcher, där det finns något att hämta.
-    if is_played(match):
-        raw_match = client.fetch_match_raw(match.MatchID)
-        _save_match_events(
-            db, match.MatchID, raw_match, {p.PlayerID for p in players}
-        )
+    # Matchhändelserna är numera både källan till spelarnas mål, assist och
+    # utvisningsminuter (lineups har dem inte längre) och till vilken period de
+    # hör (SPEC 3.3, 6.7). Events är null i lag-endpointen, så matchobjektet
+    # måste hämtas separat – men bara för spelade matcher, där det finns något
+    # att hämta.
+    raw_match = client.fetch_match_raw(match.MatchID) if is_played(match) else None
+
+    stats = (
+        player_stats_from_events(raw_match, own_player_ids)
+        if raw_match is not None
+        else None
+    )
+    _save_appearances(db, match.MatchID, players, kickoff, stats)
+
+    if raw_match is not None:
+        _save_match_events(db, match.MatchID, raw_match, own_player_ids)
 
     # Stämpla vad statistiken bygger på, så nästa synk vet om den är färdig.
     db_match.stats_final_ts = match.FinalResultCreatedTS

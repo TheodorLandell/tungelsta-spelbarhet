@@ -56,7 +56,9 @@ Säsong 2026/27 har `SeasonID = 44`. Ligger i konfiguration, inte hårdkodat.
 
 ## 3. Datakälla: iBIS publika API
 
-Bas-URL: `https://api.innebandy.se/v2/api`
+Bas-URL: `https://api.innebandy.se/v2/api/public`, i konfiguration som
+`IBIS_BASE_URL`. Sökvägen utan `/public/` svarar 403 på samtliga endpoints
+sedan hösten 2026.
 
 Ingen autentisering krävs. **Men** svaren sätter
 `Access-Control-Allow-Origin: https://stats.innebandy.se`, så anropen måste göras
@@ -102,8 +104,14 @@ Lagobjektet innehåller även `Players[]` (hela truppen) och `TeamPersons[]` (le
 GET /matches/{matchId}/lineups
 ```
 
-Returnerar `HomeTeamPlayers[]` och `AwayTeamPlayers[]`. Välj rätt array genom att
-jämföra `HomeTeamID` / `AwayTeamID` mot vårt `teamId`.
+Returnerar `HomeTeamPlayers[]` och `AwayTeamPlayers[]`, och inget annat: svaret
+har **inte** `MatchID`, `HomeTeamID` eller `AwayTeamID` på toppnivån. Vilken
+array som är vår kan därför inte avgöras ur lineup-svaret, utan avgörs av
+matchobjektets `HomeTeamID` (`get_team_players(..., is_home=...)`).
+
+En trupp som inte publicerats kommer som **null**, inte som tom lista, och det
+kan gälla bara ena sidan. Null normaliseras till tom lista – annars skulle hela
+matchen falla på ett fel som bara betyder "inget publicerat än".
 
 | Fält | Användning |
 |------|------------|
@@ -111,12 +119,23 @@ jämföra `HomeTeamID` / `AwayTeamID` mot vårt `teamId`.
 | `MatchPlayerID` | Unikt per match. Använd aldrig som spelaridentitet |
 | `Name` | Visning |
 | `ShirtNo` | Visning. Kan vara null |
-| `Goals` | Mål i matchen. Källa för del 3 |
-| `Assists` | Assist i matchen. Källa för del 3 |
-| `PenaltyMinutes` | Utvisningsminuter. Källa för del 3 |
-| `Points` | Mål + assist. Härledd, använd inte |
-| `PositionID` / `Position` | Målvaktsmarkering om ifylld |
-| `LicensedAssociationID` | Sanity-check att spelaren tillhör Tungelsta |
+| `Line` / `Captain` | Kedja och lagkapten. Används inte |
+| `ShotsOnGoal` / `GoalsAgainst` / `SavePercentage` | Målvaktssiffror från iBIS. Används inte ännu |
+
+**Mål, assist och utvisningsminuter finns inte här.** `Goals`, `Assists` och
+`PenaltyMinutes` låg tidigare per spelare i lineups men försvann i flytten till
+`/v2/api/public`. De räknas numera ur matchens `Events` (se 6.7) via
+`player_stats_from_events`, som är enda källan för del 3. Avstämt mot match
+1723835: samma siffror spelare för spelare som lineups gav tidigare.
+
+Två följder av bytet:
+
+- Utvisningsminuter utan läsbar längd i `PenaltyName` (t.ex. `"Matchstraff 1"`)
+  räknas som 0 minuter. Minuterna finns inte som eget fält, och tidigare kom
+  totalen färdigsummerad från iBIS.
+- `PositionID` / `Position` är också borta ur lineups, så målvaktsmarkeringen
+  sätts bara från lagets `Players[]` (som har dem kvar). En lineup nollar aldrig
+  en tidigare känd målvakt.
 
 Truppen läggs upp i iBIS före matchstart, så lineups kan finnas även för matcher
 som ännu inte spelats. Endast spelade matcher räknas i regelmotorn (se 3.4).

@@ -19,6 +19,7 @@ from app.ibis_client import (
     get_team_players,
     is_played,
     parse_kickoff,
+    player_stats_from_events,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -212,6 +213,118 @@ class TestGetTeamPlayers:
     def test_tom_trupp_ger_tom_lista(self, lineups_scheduled):
         players = get_team_players(lineups_scheduled, TEAM_A_ID)
         assert players == []
+
+    def test_opublicerad_trupp_kommer_som_null_och_blir_tom_lista(self):
+        """
+        iBIS svarar med null, inte tom lista, för en trupp som inte publicerats
+        – och kan göra det för bara ena sidan. Utan normalisering skulle hela
+        matchen hoppas över på ett fel som bara betyder "inget publicerat än".
+        """
+        lineups = IBISLineups.model_validate({
+            "HomeTeamPlayers": [
+                {"MatchPlayerID": 1, "PlayerID": 11, "Name": "Hemma"},
+            ],
+            "AwayTeamPlayers": None,
+        })
+        assert get_team_players(lineups, TEAM_A_ID, is_home=False) == []
+        assert len(get_team_players(lineups, TEAM_A_ID, is_home=True)) == 1
+
+    def test_is_home_valjer_sida_utan_id_i_svaret(self):
+        """
+        Lineup-svaret under /v2/api/public saknar HomeTeamID och AwayTeamID,
+        så sidan måste komma från matchobjektet via is_home.
+        """
+        lineups = IBISLineups.model_validate({
+            "HomeTeamPlayers": [
+                {"MatchPlayerID": 1, "PlayerID": 11, "Name": "Hemma"},
+            ],
+            "AwayTeamPlayers": [
+                {"MatchPlayerID": 2, "PlayerID": 22, "Name": "Borta"},
+            ],
+        })
+        assert lineups.MatchID is None
+
+        hemma = get_team_players(lineups, TEAM_A_ID, is_home=True)
+        borta = get_team_players(lineups, TEAM_A_ID, is_home=False)
+        assert [p.PlayerID for p in hemma] == [11]
+        assert [p.PlayerID for p in borta] == [22]
+
+    def test_utan_id_och_utan_is_home_ger_exception(self):
+        lineups = IBISLineups.model_validate({
+            "HomeTeamPlayers": [], "AwayTeamPlayers": [],
+        })
+        with pytest.raises(ValueError, match="is_home"):
+            get_team_players(lineups, TEAM_A_ID)
+
+    def test_is_home_vinner_over_id_i_svaret(self, lineups_played):
+        """Äldre svar har ID:na kvar, men is_home ska styra när det anges."""
+        players = get_team_players(lineups_played, TEAM_A_ID, is_home=True)
+        assert players == lineups_played.HomeTeamPlayers
+
+
+# ---------------------------------------------------------------------------
+# player_stats_from_events – mål, assist och utvisningsminuter ur Events
+# ---------------------------------------------------------------------------
+
+def _event(event_id, event_type, player_id, *, assist_id=0, penalty_name=""):
+    return {
+        "MatchEventID": event_id,
+        "MatchEventTypeID": event_type,
+        "Period": 1,
+        "PlayerID": player_id,
+        "PlayerAssistID": assist_id,
+        "PenaltyName": penalty_name,
+    }
+
+
+class TestPlayerStatsFromEvents:
+    def test_raknar_mal_assist_och_utvisningsminuter(self):
+        stats = player_stats_from_events(
+            {"Events": [
+                _event(1, 1, 10),
+                _event(2, 1, 10),
+                _event(3, 1, 20, assist_id=10),
+                _event(4, 2, 10, penalty_name="Slag, 2 min"),
+                _event(5, 2, 10, penalty_name="Hårt spel 2 min"),
+            ]},
+            {10, 20},
+        )
+        assert stats[10].goals == 2
+        assert stats[10].assists == 1
+        assert stats[10].penalty_minutes == 4
+        assert stats[20].goals == 1
+
+    def test_motstandarnas_handelser_raknas_inte(self):
+        stats = player_stats_from_events(
+            {"Events": [_event(1, 1, 999)]}, {10},
+        )
+        assert stats[10].goals == 0
+        assert 999 not in stats
+
+    def test_events_null_ger_none(self):
+        """
+        Null betyder att iBIS inte publicerat händelserna än. Anroparen ska då
+        låta tidigare sparade siffror stå kvar i stället för att nolla dem.
+        """
+        assert player_stats_from_events({"Events": None}, {10}) is None
+        assert player_stats_from_events({}, {10}) is None
+
+    def test_tom_lista_ger_nollor(self):
+        """Tom lista är ett riktigt svar: 0-0 i en match som just börjat."""
+        stats = player_stats_from_events({"Events": []}, {10})
+        assert stats is not None
+        assert stats[10].goals == 0
+        assert stats[10].penalty_minutes == 0
+
+    def test_olasbar_utvisningslangd_raknas_som_noll(self):
+        """
+        Minuterna finns bara som text i PenaltyName. "Matchstraff 1" säger
+        inget om längden och får då inte gissas till någon siffra.
+        """
+        stats = player_stats_from_events(
+            {"Events": [_event(1, 2, 10, penalty_name="Matchstraff 1")]}, {10},
+        )
+        assert stats[10].penalty_minutes == 0
 
 
 # ---------------------------------------------------------------------------

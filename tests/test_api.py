@@ -1009,11 +1009,22 @@ class TestGetLive:
             500, home_team_id=9999, away_team_id=17541,
             goals_home=2, goals_away=1,
         ))
+        # Lineups har inte längre Goals/Assists/PenaltyMinutes – siffrorna
+        # räknas ur Events. Här saknar händelserna period, vilket är fallet
+        # tidigt i en match.
         lineups = {500: _lineups(500, [
-            {"MatchPlayerID": 1, "PlayerID": 10, "Name": "Spelare Tio",
-             "Goals": 1, "Assists": 0, "PenaltyMinutes": 2},
+            {"MatchPlayerID": 1, "PlayerID": 10, "Name": "Spelare Tio"},
         ], home_id=9999, away_id=17541)}
-        monkeypatch.setattr("app.api.IBISClient", lambda *a, **kw: _fake_client(team_raw, lineups))
+        events = {500: [
+            {"MatchEventID": 1, "MatchEventTypeID": 1, "Period": None,
+             "PlayerID": 10},
+            {"MatchEventID": 2, "MatchEventTypeID": 2, "Period": None,
+             "PlayerID": 10, "PenaltyName": "Slag, 2 min"},
+        ]}
+        monkeypatch.setattr(
+            "app.api.IBISClient",
+            lambda *a, **kw: _fake_client(team_raw, lineups, events),
+        )
 
         data = api_client.get("/api/live").json()
         assert len(data["matcher"]) == 1

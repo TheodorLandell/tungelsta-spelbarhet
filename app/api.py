@@ -44,10 +44,12 @@ from app.ibis_client import (
     EVENT_GOAL,
     IBISClient,
     IBISMatch,
+    PlayerMatchStats,
     get_team_players,
     is_played,
     parse_match_events,
     penalty_minutes_from_name,
+    player_stats_from_events,
 )
 from app.models import (
     Appearance,
@@ -934,16 +936,20 @@ def _live_match_row(client: IBISClient, m: Match, md: dict, team_id: int) -> dic
     if played:
         try:
             lineups = client.fetch_lineups(m.match_id)
-            players = get_team_players(lineups, team_id)
+            players = get_team_players(lineups, team_id, is_home=hemma)
+            own_ids = {p.PlayerID for p in players}
 
-            # Events ger perioden, men är null i lag-endpointen. Under matchen
-            # är det just periodsiffrorna tränaren tittar på, så matchobjektet
-            # hämtas separat (SPEC 6.6, 6.7). Misslyckas det visas målen ändå,
-            # bara utan perioduppdelning.
+            # Matchobjektet är enda källan till spelarnas siffror: lineups har
+            # inte längre Goals, Assists eller PenaltyMinutes. Samma anrop ger
+            # perioden, som är just det tränaren tittar på under matchen
+            # (SPEC 6.6, 6.7).
             mal_ev: dict[int, dict[int, int]] = {}
             utv_ev: dict[int, dict[int, int]] = {}
+            stats: dict[int, PlayerMatchStats] | None = None
             try:
-                for e in parse_match_events(client.fetch_match_raw(m.match_id)):
+                raw_match = client.fetch_match_raw(m.match_id)
+                stats = player_stats_from_events(raw_match, own_ids)
+                for e in parse_match_events(raw_match):
                     if e.Period is None or e.PlayerID is None:
                         continue
                     if e.MatchEventTypeID == EVENT_GOAL:
@@ -956,9 +962,16 @@ def _live_match_row(client: IBISClient, m: Match, md: dict, team_id: int) -> dic
             except (httpx.HTTPError, ValueError, KeyError):
                 pass
 
+            if stats is None:
+                # Matchobjektet gick inte att hämta, eller så har iBIS inte
+                # publicerat händelserna. Visa inga spelarsiffror alls i
+                # stället för nollor som ser ut som att ingen gjort mål.
+                players = []
+
             for p in players:
-                p_mal = p.Goals or 0
-                p_utv = p.PenaltyMinutes or 0
+                s = stats.get(p.PlayerID) or PlayerMatchStats()
+                p_mal = s.goals
+                p_utv = s.penalty_minutes
                 mal_perioder, mal_utan = split_by_period(
                     p_mal, mal_ev.get(p.PlayerID, {})
                 )
@@ -970,7 +983,7 @@ def _live_match_row(client: IBISClient, m: Match, md: dict, team_id: int) -> dic
                     "mal": p_mal,
                     "mal_perioder": mal_perioder,
                     "mal_utan_period": mal_utan,
-                    "assist": p.Assists or 0,
+                    "assist": s.assists,
                     "utvisningsminuter": p_utv,
                     "utv_perioder": utv_perioder,
                     "utv_utan_period": utv_utan,

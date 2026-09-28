@@ -14,6 +14,7 @@ Kopiera `.env.example` till `.env` och fyll i `APP_PASSWORD`.
 | `SEASON_ID` | iBIS säsongs-ID | `44` |
 | `TEAM_A_ID` | iBIS team-ID för A-laget | `1977` |
 | `TEAM_B_ID` | iBIS team-ID för B-laget | `17541` |
+| `IBIS_BASE_URL` | Bas-URL till iBIS publika API | `https://api.innebandy.se/v2/api/public` |
 | `DATABASE_URL` | SQLAlchemy-URL till databasen | `sqlite:///./tungelsta.db` |
 
 I Docker sätter `docker-compose.yml` `DATABASE_URL=sqlite:////data/tungelsta.db` automatiskt så att databasen hamnar i volymen.
