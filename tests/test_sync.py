@@ -12,11 +12,21 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.ibis_client import IBISClient, IBISLineups, IBISTeam
-from app.models import Appearance, Base, Match, Player, PlayerTeam, ShotEvent, SyncLog
+from app.models import (
+    Appearance,
+    Base,
+    Match,
+    Player,
+    PlayerTeam,
+    RosterEdit,
+    ShotEvent,
+    SyncLog,
+)
 from app.status import get_statuses
 from app.sync import (
     SyncResult,
     _has_appearances,
+    _prune_appearances,
     _match_status,
     _now_naive,
     _opponent,
@@ -1356,3 +1366,358 @@ class TestMatchUtanSattDatum:
         # Nu räknas matchen: spelare 42 spelade A utan B först → låst.
         statuses, _ = get_statuses(db)
         assert statuses[42].locked is True
+
+
+class TestBorttagenUrMatchtruppen:
+    """
+    En spelare som plockas ur matchtruppen i iBIS ska försvinna ur appearances
+    vid nästa synk. Synken speglade tidigare bara tillägg, så spelaren låg kvar
+    och fick tas bort för hand i Ändra matchlista.
+
+    Konkret fall ur buggrapporten: William Lindahl stod i truppen för
+    Täbymatchen (1703100) när den hämtades, men togs sedan bort i iBIS.
+    """
+
+    def _spelad(self, match_id: int = 1703100) -> dict:
+        return make_match_dict(
+            match_id, match_datetime="2026-09-19T13:15:00",
+            goals_home=2, goals_away=3,
+            final_result_ts="2026-09-19T15:30:00",
+        )
+
+    def test_spelare_borta_ur_ibis_tas_bort_vid_nasta_synk(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._spelad()
+        full = make_lineups_dict(1703100, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+            make_player_dict(77, "William Lindahl", "22"),
+        ])
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703100: full}),
+        ).ok is True
+        assert {a.player_id for a in db.scalars(
+            select(Appearance).where(Appearance.match_id == 1703100)
+        ).all()} == {42, 77}
+
+        # iBIS plockar bort 77 ur truppen. Matchen hämtades om ovan och skulle
+        # nu hoppas över, så nolla stämpeln – samma läge som när iBIS rättar
+        # slutrapporten och matchen hämtas om (SPEC 6.7).
+        db.get(Match, 1703100).stats_final_ts = None
+        db.flush()
+
+        utan = make_lineups_dict(1703100, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        log = run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703100: utan}),
+        )
+
+        assert log.ok is True
+        assert {a.player_id for a in db.scalars(
+            select(Appearance).where(Appearance.match_id == 1703100)
+        ).all()} == {42}
+        assert any("borttagen ur matchtruppen" in w for w in log.warnings)
+
+    def test_borttagen_spelare_forsvinner_ur_kedjan(self, db, monkeypatch):
+        """Regelmotorn räknar på appearances – borttagningen ska slå igenom."""
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        def spelad(match_id, datum, away_id=TEAM_A_ID):
+            return make_match_dict(
+                match_id, away_team_id=away_id, match_datetime=f"{datum}T19:00:00",
+                goals_home=1, goals_away=0,
+                final_result_ts=f"{datum}T21:00:00",
+            )
+
+        # B-match först, så kvalificeringsregeln är uppfylld och det bara är
+        # kedjeregeln som avgör. Tre A-matcher i rad låser på den tredje.
+        b0 = spelad(2000, "2026-08-25", away_id=TEAM_B_ID)
+        a1 = spelad(2001, "2026-09-01")
+        a2 = spelad(2002, "2026-09-08")
+        a3 = spelad(2003, "2026-09-15")
+        kalle = [make_player_dict(42, "Kalle", "7")]
+        lineups = {
+            mid: make_lineups_dict(mid, away_players=kalle)
+            for mid in (2000, 2001, 2002, 2003)
+        }
+
+        def kor():
+            return run_sync(
+                db,
+                build_client(
+                    team_a_dict=make_team_dict(TEAM_A_ID, [a1, a2, a3]),
+                    team_b_dict=make_team_dict(TEAM_B_ID, [b0]),
+                    lineups_by_id=lineups,
+                ),
+            )
+
+        assert kor().ok is True
+        assert get_statuses(db)[0][42].locked is True
+
+        # iBIS plockar bort honom ur den tredje matchen. Truppen är inte tom –
+        # en annan spelare står kvar.
+        db.get(Match, 2003).stats_final_ts = None
+        db.flush()
+        lineups[2003] = make_lineups_dict(2003, away_players=[
+            make_player_dict(99, "Annan", "8"),
+        ])
+
+        assert kor().ok is True
+
+        assert db.get(Appearance, (2003, 42)) is None
+        # Kvar: två A-matcher. Kedjeregeln låser först på den tredje.
+        assert get_statuses(db)[0][42].locked is False
+
+    def test_tom_lineup_tar_inte_bort_nagot(self, db, monkeypatch):
+        """Opublicerad trupp betyder inte att alla plockats ur (tom lista)."""
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._spelad(1703101)
+        full = make_lineups_dict(1703101, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703101: full}),
+        ).ok is True
+
+        db.get(Match, 1703101).stats_final_ts = None
+        db.flush()
+
+        tom = make_lineups_dict(1703101, away_players=[])
+        log = run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703101: tom}),
+        )
+
+        assert log.ok is True
+        assert db.get(Appearance, (1703101, 42)) is not None
+        assert not any("matchtruppen i iBIS" in w for w in log.warnings)
+
+    def test_null_lineup_tar_inte_bort_nagot(self, db, monkeypatch):
+        """Samma sak när iBIS svarar med null i stället för en tom lista."""
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._spelad(1703102)
+        full = make_lineups_dict(1703102, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703102: full}),
+        ).ok is True
+
+        db.get(Match, 1703102).stats_final_ts = None
+        db.flush()
+
+        null_lineup = make_lineups_dict(1703102)
+        null_lineup["HomeTeamPlayers"] = None
+        null_lineup["AwayTeamPlayers"] = None
+        log = run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703102: null_lineup}),
+        )
+
+        assert log.ok is True
+        assert db.get(Appearance, (1703102, 42)) is not None
+
+    def test_manuellt_tillagd_spelare_finns_kvar_efter_synk(self, db, monkeypatch):
+        """
+        roster_edits är ett eget lager ovanpå iBIS (SPEC 6.5). En manuellt
+        tillagd spelare har ingen appearance att ta bort, och ska finnas kvar i
+        den effektiva truppen även när han aldrig stått i iBIS.
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._spelad(1703103)
+        lineups = make_lineups_dict(1703103, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703103: lineups}),
+        ).ok is True
+
+        db.add(Player(player_id=55, name="Manuell Spelare",
+                      last_seen=datetime(2026, 9, 19, 13, 15)))
+        db.add(RosterEdit(
+            match_id=1703103, player_id=55, action="add",
+            note="stod i truppen men saknas i iBIS",
+            created_at=datetime(2026, 9, 19, 16, 0), created_by="TL",
+        ))
+        db.get(Match, 1703103).stats_final_ts = None
+        db.flush()
+
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703103: lineups}),
+        ).ok is True
+
+        # Editen är orörd och spelaren räknas fortfarande i regelmotorn.
+        edits = db.scalars(
+            select(RosterEdit).where(RosterEdit.match_id == 1703103)
+        ).all()
+        assert [(e.player_id, e.action) for e in edits] == [(55, "add")]
+        assert 55 in get_statuses(db)[0]
+
+    def test_overflodig_manuell_borttagning_kraschar_inte(self, db, monkeypatch):
+        """
+        iBIS hinner före en manuell borttagning: editen pekar nu på en spelare
+        som inte längre har någon appearance. Det ska gå igenom utan fel.
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._spelad(1703104)
+        full = make_lineups_dict(1703104, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+            make_player_dict(77, "William Lindahl", "22"),
+        ])
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703104: full}),
+        ).ok is True
+
+        # Tränaren tog bort honom för hand innan iBIS rättades.
+        db.add(RosterEdit(
+            match_id=1703104, player_id=77, action="remove",
+            note="stod inte i truppen",
+            created_at=datetime(2026, 9, 19, 16, 0), created_by="TL",
+        ))
+        db.get(Match, 1703104).stats_final_ts = None
+        db.flush()
+
+        utan = make_lineups_dict(1703104, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        log = run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                         lineups_by_id={1703104: utan}),
+        )
+
+        assert log.ok is True
+        assert db.get(Appearance, (1703104, 77)) is None
+        statuses, _ = get_statuses(db)
+        assert 77 not in statuses
+
+    def test_fardigrapporterad_match_ror_inte_appearances(self, db, monkeypatch):
+        """
+        En match vars statistik hämtades efter slutrapporten hämtas inte om
+        (SPEC 3.5) – då får truppen inte heller röras.
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        db.add(Match(match_id=1703105, team="A", competition_id=100,
+                     kickoff=datetime(2026, 9, 19, 13, 15), status="played",
+                     raw={}, stats_final_ts="2026-09-19T15:30:00"))
+        db.add(Player(player_id=77, name="William Lindahl",
+                      last_seen=datetime(2026, 9, 19, 13, 15)))
+        db.add(Appearance(match_id=1703105, player_id=77,
+                          player_name="William Lindahl", shirt_no="22"))
+        db.flush()
+
+        m = self._spelad(1703105)
+        tom = make_lineups_dict(1703105, away_players=[])
+        client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+                              lineups_by_id={1703105: tom})
+
+        assert run_sync(db, client).ok is True
+
+        client.fetch_lineups.assert_not_called()
+        assert db.get(Appearance, (1703105, 77)) is not None
+
+    def test_spelaren_finns_kvar_i_players_med_sin_historik(self, db, monkeypatch):
+        """
+        Bara appearance-raden för matchen försvinner. Spelaren, hans övriga
+        matcher och hans registrerade skott är orörda.
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        tidigare = make_match_dict(2101, match_datetime="2026-09-12T19:00:00",
+                                   goals_home=1, goals_away=0,
+                                   final_result_ts="2026-09-12T21:00:00")
+        senare = self._spelad(2102)
+        william = make_player_dict(77, "William Lindahl", "22")
+        lineups = {
+            2101: make_lineups_dict(2101, away_players=[william]),
+            2102: make_lineups_dict(2102, away_players=[william]),
+        }
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [tidigare, senare]),
+                         lineups_by_id=lineups),
+        ).ok is True
+
+        db.add(ShotEvent(
+            id="uuid-william", match_id=2102, player_id=77, side="egen",
+            kind="on_goal", period=2, created_at=datetime(2026, 9, 19, 14, 0),
+        ))
+        db.get(Match, 2102).stats_final_ts = None
+        db.flush()
+
+        lineups[2102] = make_lineups_dict(2102, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        assert run_sync(
+            db,
+            build_client(team_a_dict=make_team_dict(TEAM_A_ID, [tidigare, senare]),
+                         lineups_by_id=lineups),
+        ).ok is True
+
+        spelare = db.get(Player, 77)
+        assert spelare is not None
+        assert spelare.name == "William Lindahl"
+        assert spelare.shirt_no == "22"
+        # Den tidigare matchen är orörd, den senare borta.
+        assert db.get(Appearance, (2101, 77)) is not None
+        assert db.get(Appearance, (2102, 77)) is None
+        # Skotten ligger kvar i databasen – de raderas aldrig av en synk.
+        assert db.get(ShotEvent, "uuid-william") is not None
+
+
+class TestPruneAppearances:
+    """Enhetstester för _prune_appearances."""
+
+    def _bygg(self, db, match_id=3001, player_ids=(1, 2)):
+        db.add(Match(match_id=match_id, team="A", competition_id=100,
+                     kickoff=datetime(2026, 9, 19, 13, 15), status="played",
+                     raw={}))
+        for pid in player_ids:
+            db.add(Player(player_id=pid, name=f"Spelare {pid}",
+                          last_seen=datetime(2026, 9, 19, 13, 15)))
+            db.add(Appearance(match_id=match_id, player_id=pid,
+                              player_name=f"Spelare {pid}"))
+        db.flush()
+
+    def test_tar_bort_den_som_inte_star_i_truppen(self, db):
+        self._bygg(db)
+        assert _prune_appearances(db, 3001, {1}) == 1
+        assert db.get(Appearance, (3001, 1)) is not None
+        assert db.get(Appearance, (3001, 2)) is None
+
+    def test_oforandrad_trupp_tar_inte_bort_nagot(self, db):
+        self._bygg(db)
+        assert _prune_appearances(db, 3001, {1, 2}) == 0
+
+    def test_ror_bara_den_angivna_matchen(self, db):
+        self._bygg(db, 3001, (1, 2))
+        db.add(Match(match_id=3002, team="A", competition_id=100,
+                     kickoff=datetime(2026, 9, 26, 13, 15), status="played",
+                     raw={}))
+        db.add(Appearance(match_id=3002, player_id=2, player_name="Spelare 2"))
+        db.flush()
+
+        assert _prune_appearances(db, 3001, {1}) == 1
+        assert db.get(Appearance, (3002, 2)) is not None

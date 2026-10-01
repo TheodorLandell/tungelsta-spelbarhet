@@ -337,6 +337,36 @@ def _save_appearances(
             existing.penalty_minutes = s.penalty_minutes
 
 
+def _prune_appearances(db: Session, match_id: int, squad_ids: set[int]) -> int:
+    """
+    Tar bort appearances för spelare som inte längre står i iBIS-truppen.
+
+    Synken ska spegla iBIS. En spelare som plockas ur matchtruppen efter att
+    matchen hämtats ska försvinna ur matchens underlag, inte ligga kvar tills
+    någon tar bort honom för hand.
+
+    Anropas bara med en trupp som faktiskt innehåller spelare. Är lineups tom
+    eller opublicerad betyder det att truppen inte ligger uppe, inte att alla
+    plockats ur – då får inget tas bort.
+
+    roster_edits rörs aldrig. De ligger som ett eget lager ovanpå iBIS-datan
+    (SPEC 6.5): en manuellt tillagd spelare finns kvar även när han inte står i
+    iBIS, och en manuell borttagning som iBIS nu hunnit före blir bara
+    överflödig. Spelaren själv och hans skott ligger kvar – appearance-raden för
+    den här matchen är det enda som försvinner. Returnerar antalet borttagna rader.
+    """
+    borttagna = 0
+    for row in db.scalars(
+        select(Appearance).where(Appearance.match_id == match_id)
+    ).all():
+        if row.player_id not in squad_ids:
+            db.delete(row)
+            borttagna += 1
+    if borttagna:
+        db.flush()
+    return borttagna
+
+
 def _save_match_events(
     db: Session,
     match_id: int,
@@ -472,6 +502,19 @@ def _sync_one_match(
         else None
     )
     _save_appearances(db, match.MatchID, players, kickoff, stats)
+
+    # …och ta bort dem som inte längre står i truppen. Utan det här speglar
+    # synken bara tillägg: en spelare som plockats ur truppen i iBIS låg kvar
+    # och fick tas bort för hand i Ändra matchlista. En tom trupp betyder att
+    # den inte är publicerad och tömmer aldrig underlaget (_prune_appearances).
+    if players:
+        borttagna = _prune_appearances(db, match.MatchID, own_player_ids)
+        if borttagna:
+            etikett = "borttagen" if borttagna == 1 else "borttagna"
+            warnings.append(
+                f"Match {match.MatchID} ({match.MatchDateTime[:10]}): "
+                f"{borttagna} spelare {etikett} ur matchtruppen i iBIS"
+            )
 
     if raw_match is not None:
         _save_match_events(db, match.MatchID, raw_match, own_player_ids)

@@ -527,3 +527,67 @@ class TestRosterEdits:
         assert row["matcher"] == 1
         assert row["mal"] == 0  # ingen appearance, inga iBIS-siffror
         assert row["skott"] == {"registrerat": False}
+
+
+# ---------------------------------------------------------------------------
+# Borttagen ur iBIS-truppen (synken speglar iBIS)
+# ---------------------------------------------------------------------------
+
+class TestBorttagenUrTruppen:
+    """
+    Tas en spelare bort ur matchtruppen i iBIS raderar synken hans appearance
+    för den matchen. Skotten han hunnit få registrerade ligger kvar i
+    shot_events – de är en tränares inmatning och raderas aldrig av en synk –
+    men de räknas inte i statistiken, eftersom han inte längre står i truppen.
+    """
+
+    def test_skott_i_matchen_raknas_inte_utan_appearance(self, client, db):
+        add_match(db, 1, "A", datetime(2026, 9, 1))
+        add_player(db, 10, "Kalle", "7")
+        # Ingen appearance för 10: iBIS har plockat bort honom ur truppen.
+        add_shot(db, "s1", 1, 10, "on_goal")
+        add_shot(db, "s2", 1, 10, "missed")
+        db.flush()
+
+        assert client.get("/api/stats?team=A").json()["spelare"] == []
+        # Raderna finns kvar i databasen, de räknas bara inte.
+        assert db.get(ShotEvent, "s1") is not None
+        assert db.get(ShotEvent, "s2") is not None
+
+    def test_ovriga_matcher_raknas_fortfarande(self, client, db):
+        add_match(db, 1, "A", datetime(2026, 9, 1))
+        add_match(db, 2, "A", datetime(2026, 9, 8))
+        add_player(db, 10, "Kalle", "7")
+        # Kvar i match 1, borttagen ur match 2.
+        add_appearance(db, 1, 10, "Kalle", goals=1)
+        add_shot(db, "s1", 1, 10, "on_goal")
+        add_shot(db, "s2", 2, 10, "on_goal")
+        add_shot(db, "s3", 2, 10, "blocked")
+        db.flush()
+
+        row = rows_by_id(client.get("/api/stats?team=A").json())[10]
+        assert row["matcher"] == 1
+        assert row["mal"] == 1
+        # Ett registrerat skott på mål plus målet, inget från match 2.
+        assert row["skott"]["totalt"] == 2
+        assert row["skott"]["pa_mal"]["antal"] == 2
+        assert row["skott"]["i_tack"]["antal"] == 0
+
+    def test_manuellt_tillagd_igen_raknar_skotten(self, client, db):
+        """
+        Rättar tränaren iBIS-felet med Ändra matchlista står spelaren i truppen
+        igen – och då räknas skotten han redan hunnit få registrerade.
+        """
+        add_match(db, 1, "A", datetime(2026, 9, 1))
+        add_player(db, 10, "Kalle", "7")
+        db.add(PlayerTeam(player_id=10, team="A"))
+        add_shot(db, "s1", 1, 10, "on_goal")
+        add_shot(db, "s2", 1, 10, "missed")
+        add_roster_edit(db, 1, 10, "add")
+        db.flush()
+
+        row = rows_by_id(client.get("/api/stats?team=A").json())[10]
+        assert row["matcher"] == 1
+        assert row["skott"]["totalt"] == 2
+        assert row["skott"]["pa_mal"]["antal"] == 1
+        assert row["skott"]["utanfor"]["antal"] == 1
