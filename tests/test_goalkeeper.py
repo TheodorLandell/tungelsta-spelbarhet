@@ -11,14 +11,14 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import app, get_db, _clear_status_cache
 from app.auth import require_session
 from app.goalkeeper import attribute_conceded, save_stats
-from app.models import Appearance, Base, Match, Player, ShotEvent
+from app.models import Appearance, Base, Match, Player, RosterEdit, ShotEvent
 
 # Lag A i testkonfigurationen. Matchen spelas hemma, så motståndaren är borta.
 TEAM_A_ID = 1977
@@ -97,6 +97,13 @@ def add_opponent_shot(db, match_id, kind, period, gk_id, *, deleted_at=None):
         goalkeeper_id=gk_id, side="motstandare", kind=kind, period=period,
         created_at=datetime(2026, 9, 1, 19, 30), created_by="Theo",
         deleted_at=deleted_at,
+    ))
+
+
+def add_roster_edit(db, match_id, player_id, action, note="iBIS-fel"):
+    db.add(RosterEdit(
+        match_id=match_id, player_id=player_id, action=action, note=note,
+        created_at=datetime(2026, 9, 1, 22, 0), created_by="Theo",
     ))
 
 
@@ -383,3 +390,144 @@ class TestShotEventGoalkeeper:
         assert self._post(client).status_code == 200
         rows = client.get("/api/matches/1/shot-events").json()["handelser"]
         assert rows[0]["goalkeeper_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Målvakt borttagen ur matchens trupp
+# ---------------------------------------------------------------------------
+
+class TestMalvaktBorttagenUrTruppen:
+    """
+    En målvakt räknas bara i de matcher där han står i den effektiva truppen,
+    alltså appearances plus roster_edits. Plockas han ur truppen – i iBIS eller
+    för hand – ska matchens insläppta mål och skott på mål mot inte längre höra
+    till honom. Skottraderna ligger kvar i databasen och räknas igen så snart
+    han står i truppen på nytt.
+    """
+
+    def _tva_matcher(self, db):
+        """
+        Två matcher med samma målvakt. Match 1: 6 räddningar, 1 insläppt.
+        Match 2: 4 räddningar, 2 insläppta. Appearance sätts av anroparen.
+        """
+        add_match(db, 1, motstandar_mal=1, perioder={1: 1, 2: 0, 3: 0})
+        add_match(db, 2, motstandar_mal=2, perioder={1: 2, 2: 0, 3: 0})
+        add_gk(db, 10, "Målvakt A")
+        for _ in range(6):
+            add_opponent_shot(db, 1, "on_goal", 1, 10)
+        for _ in range(4):
+            add_opponent_shot(db, 2, "on_goal", 1, 10)
+
+    def test_borttagen_ur_ibis_truppen_tappar_matchens_siffror(self, client, db):
+        # Appearance bara i match 1 – iBIS har plockat honom ur match 2.
+        self._tva_matcher(db)
+        add_appearance(db, 1, 10, "Målvakt A")
+        db.flush()
+
+        s = gk_row(client.get("/api/stats?team=A").json(), 10)["malvaktsstatistik"]
+
+        # Bara match 1: 6 räddningar + 1 insläppt = 7 på mål mot.
+        assert s["registrerat"] is True
+        assert s["raddningar"] == 6
+        assert s["inslappta"] == 1
+        assert s["skott_pa_mal_mot"] == 7
+        assert s["raddningsprocent"] == 86
+
+    def test_borttagen_via_roster_edit_tappar_matchens_siffror(self, client, db):
+        # Appearance finns i båda, men match 2 är manuellt rättad.
+        self._tva_matcher(db)
+        add_appearance(db, 1, 10, "Målvakt A")
+        add_appearance(db, 2, 10, "Målvakt A")
+        add_roster_edit(db, 2, 10, "remove")
+        db.flush()
+
+        s = gk_row(client.get("/api/stats?team=A").json(), 10)["malvaktsstatistik"]
+
+        assert s["raddningar"] == 6
+        assert s["inslappta"] == 1
+        assert s["skott_pa_mal_mot"] == 7
+        assert s["raddningsprocent"] == 86
+
+    def test_tillbaka_via_roster_edit_raknar_matchen_igen(self, client, db):
+        # Ingen appearance i match 2, men tränaren har lagt tillbaka honom.
+        self._tva_matcher(db)
+        add_appearance(db, 1, 10, "Målvakt A")
+        add_roster_edit(db, 2, 10, "add")
+        db.flush()
+
+        s = gk_row(client.get("/api/stats?team=A").json(), 10)["malvaktsstatistik"]
+
+        # Båda matcherna: 10 räddningar + 3 insläppta = 13 på mål mot.
+        assert s["raddningar"] == 10
+        assert s["inslappta"] == 3
+        assert s["skott_pa_mal_mot"] == 13
+        assert s["raddningsprocent"] == 77
+
+    def test_bada_matcherna_raknas_nar_han_star_i_truppen(self, client, db):
+        """Jämförelsefall: utan borttagning räknas allt som förut."""
+        self._tva_matcher(db)
+        add_appearance(db, 1, 10, "Målvakt A")
+        add_appearance(db, 2, 10, "Målvakt A")
+        db.flush()
+
+        s = gk_row(client.get("/api/stats?team=A").json(), 10)["malvaktsstatistik"]
+
+        assert s["raddningar"] == 10
+        assert s["inslappta"] == 3
+        assert s["skott_pa_mal_mot"] == 13
+        assert s["raddningsprocent"] == 77
+
+    def test_skottraderna_ligger_kvar_i_databasen(self, client, db):
+        self._tva_matcher(db)
+        add_appearance(db, 1, 10, "Målvakt A")
+        db.flush()
+
+        client.get("/api/stats?team=A")
+
+        kvar = db.scalars(
+            select(ShotEvent).where(ShotEvent.match_id == 2)
+        ).all()
+        assert len(kvar) == 4
+        assert all(s.goalkeeper_id == 10 for s in kvar)
+
+    def test_hans_mal_laggs_inte_pa_den_andra_malvakten(self, client, db):
+        """
+        Insläppta mål har bara period, inte målvakt. Perioderna den borttagne
+        täckte blir utan registrering, och målen därifrån räknas som
+        oattribuerade – de får aldrig flyttas över till den som står kvar.
+        """
+        # Match 1: A står period 1 (3 skott, 1 insläppt), B period 3
+        # (4 skott, 2 insläppta). B plockas ur truppen för match 1.
+        add_match(db, 1, motstandar_mal=3, perioder={1: 1, 2: 0, 3: 2})
+        # Match 2: B står hela matchen och håller nollan. Den matchen behåller
+        # han, så han finns kvar på statistiksidan att jämföra med.
+        add_match(db, 2, motstandar_mal=0, perioder={1: 0, 2: 0, 3: 0})
+        add_gk(db, 10, "Målvakt A")
+        add_gk(db, 20, "Målvakt B")
+        add_appearance(db, 1, 10, "Målvakt A")
+        add_appearance(db, 1, 20, "Målvakt B")
+        add_appearance(db, 2, 20, "Målvakt B")
+        add_roster_edit(db, 1, 20, "remove")
+        for _ in range(3):
+            add_opponent_shot(db, 1, "on_goal", 1, 10)
+        for _ in range(4):
+            add_opponent_shot(db, 1, "on_goal", 3, 20)
+        for _ in range(2):
+            add_opponent_shot(db, 2, "on_goal", 1, 20)
+        db.flush()
+
+        data = client.get("/api/stats?team=A").json()
+
+        # B behåller bara match 2.
+        b = gk_row(data, 20)["malvaktsstatistik"]
+        assert b["raddningar"] == 2
+        assert b["inslappta"] == 0
+        assert b["skott_pa_mal_mot"] == 2
+        assert b["raddningsprocent"] == 100
+
+        # A är orörd: målet i period 1, inte de två i period 3 som B mötte.
+        a = gk_row(data, 10)["malvaktsstatistik"]
+        assert a["inslappta"] == 1
+        assert a["raddningar"] == 3
+        assert a["skott_pa_mal_mot"] == 4
+        assert a["raddningsprocent"] == 75

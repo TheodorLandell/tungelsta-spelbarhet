@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     ibis_base_url: str = "https://api.innebandy.se/v2/api/public"
     app_password: str
     database_url: str = "sqlite:///./tungelsta.db"
+    # Hur länge efter kickoff en färdigrapporterad match fortsätter hämtas om
+    # (SPEC 3.5, 6.7). Rättelser i trupp och resultat görs dagen eller dagarna
+    # efter matchen, och utan ett fönster fryser underlaget vid slutrapporten.
+    # Ligger i konfiguration så att fönstret kan ändras utan omdeploy.
+    resync_window_days: int = 3
 
 
 settings = Settings()

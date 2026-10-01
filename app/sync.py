@@ -301,6 +301,30 @@ def _has_appearances(db: Session, match_id: int) -> bool:
     ).first() is not None
 
 
+def _within_resync_window(kickoff: datetime) -> bool:
+    """
+    True så länge en färdigrapporterad match fortsätter hämtas om (SPEC 3.5).
+
+    Stämpeln ``stats_final_ts`` ensam fryser underlaget så snart statistiken
+    hämtats efter slutrapporten. Rättelser som sekretariatet gör i efterhand –
+    en spelare som plockas ur truppen, ett mål som flyttas – syns i iBIS men
+    aldrig hos oss, eftersom lineups inte hämtas om.
+
+    Fönstret håller därför matchen öppen några dygn efter kickoff, vilket är när
+    rättelser faktiskt görs. Kostnaden är liten: ett lag spelar som mest en match
+    i veckan, så bara ett par matcher ligger i fönstret vid varje synk.
+
+    Gränsen är inklusive – exakt på dygnsgränsen ligger matchen kvar i fönstret –
+    och följer därmed sjudagarsregeln för kommande matcher längre ned. Noll eller
+    negativt antal dygn stänger av fönstret helt: då fryser underlaget vid
+    slutrapporten och en rättelse kräver ``python -m app.refresh_match``.
+    """
+    dagar = settings.resync_window_days
+    if dagar <= 0:
+        return False
+    return _now_naive() - kickoff <= timedelta(days=dagar)
+
+
 def _save_appearances(
     db: Session,
     match_id: int,
@@ -461,18 +485,26 @@ def _sync_one_match(
     kickoff = parse_kickoff(match.MatchDateTime).replace(tzinfo=None)
 
     # En färdigrapporterad match hämtas inte om (SPEC 3.5) – men bara om
-    # statistiken faktiskt hämtades *efter* att slutresultatet rapporterades.
+    # statistiken faktiskt hämtades *efter* att slutresultatet rapporterades,
+    # och bara när matchen hunnit ut ur omhämtningsfönstret.
     #
     # Trupper publiceras före matchstart, så appearances skrivs redan före och
     # under matchen. En spelare som får sin andra utvisning i period 3 hann då
     # sparas med halva antalet minuter. Den gamla regeln såg bara att det fanns
     # appearances och frös de siffrorna för alltid. Genom att jämföra mot
     # stats_final_ts hämtas matchen om en gång efter slutrapporten, och igen om
-    # sekretariatet rättar resultatet i efterhand.
+    # sekretariatet rättar *resultatet* i efterhand.
+    #
+    # Rättelser i truppen rör däremot inte FinalResultCreatedTS, så stämpeln
+    # fångar dem aldrig. Fönstret gör det i stället: de första dygnen efter
+    # kickoff hämtas matchen om vid varje synk, och först därefter fryser den.
+    # En rättelse som kommer senare än så knuffas fram med
+    # ``python -m app.refresh_match <match-id>``.
     if (
         match.FinalResultCreatedTS
         and db_match.stats_final_ts == match.FinalResultCreatedTS
         and _has_appearances(db, match.MatchID)
+        and not _within_resync_window(kickoff)
     ):
         return is_new
 

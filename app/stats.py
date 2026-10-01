@@ -77,10 +77,21 @@ def _shares(parts: list[int], total: int) -> list[int | None]:
 
 
 def _goalkeeper_totals(
-    db: Session, team: str, scoped_set: set[int], matches: list[Match]
+    db: Session,
+    team: str,
+    scoped_set: set[int],
+    matches: list[Match],
+    squad: set[tuple[int, int]],
 ) -> dict:
     """
     Summerar målvaktssiffror över omfattningen.
+
+    ``squad`` är matchens effektiva trupp, (match_id, player_id) ur appearances
+    plus roster_edits – samma trupp som utespelarnas siffror räknas över. En
+    målvakt räknas bara i de matcher där han står i den: plockas han ur truppen,
+    i iBIS eller för hand, ska han inte behålla matchens insläppta mål och skott
+    på mål mot. Skottraderna ligger kvar i databasen och räknas igen så snart
+    han står i truppen på nytt.
 
     Returnerar ``{"registrerade": {gk: skott på mål mot}, "inslappta": {gk: mål},
     "sedda": set, "approximativ": bool, "oattribuerat": int}``. ``sedda`` är de
@@ -112,6 +123,12 @@ def _goalkeeper_totals(
         # Skott registrerade innan målvaktsvalet fanns saknar målvakt och
         # räknas inte in någonstans – hellre saknad siffra än gissad.
         if e.goalkeeper_id is None:
+            continue
+        # Stod han inte i matchens trupp hör skottet inte till hans statistik.
+        # Perioderna han täckte blir då utan registrering, och insläppta mål
+        # därifrån räknas som oattribuerade i stället för att läggas på någon
+        # annan målvakt (attribute_conceded).
+        if (e.match_id, e.goalkeeper_id) not in squad:
             continue
         sedda.add(e.goalkeeper_id)
         bucket = per_match.setdefault(e.match_id, {}).setdefault(e.period, {})
@@ -199,7 +216,7 @@ def compute_stats(db: Session, team: str, scope: str, n: int = 5) -> dict:
     # Målvaktsstatistik (SPEC 6.8). Motståndarens skott bär själva vilken
     # målvakt som stod, medan insläppta mål bara har period och därför
     # tilldelas per period.
-    gk = _goalkeeper_totals(db, team, scoped_set, matches)
+    gk = _goalkeeper_totals(db, team, scoped_set, matches, squad)
 
     matches_by_player: dict[int, list[int]] = {}
     for (m, p) in squad:

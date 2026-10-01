@@ -27,6 +27,7 @@ from app.sync import (
     SyncResult,
     _has_appearances,
     _prune_appearances,
+    _within_resync_window,
     _match_status,
     _now_naive,
     _opponent,
@@ -39,7 +40,15 @@ TEAM_A_ID = 1977
 TEAM_B_ID = 17541
 OTHER_ID = 9999
 
-MOCK_SETTINGS = SimpleNamespace(season_id=44, team_a_id=TEAM_A_ID, team_b_id=TEAM_B_ID)
+# resync_window_days måste finnas här: _within_resync_window läser det ur
+# settings, och ett saknat fält hade blivit ett AttributeError som synkens
+# per-match-try/except sväljer som en varning i stället för att fälla testet.
+MOCK_SETTINGS = SimpleNamespace(
+    season_id=44,
+    team_a_id=TEAM_A_ID,
+    team_b_id=TEAM_B_ID,
+    resync_window_days=3,
+)
 
 
 def soon(days: int = 3) -> str:
@@ -432,9 +441,13 @@ class TestRunSync:
                             final_result_ts="2020-01-15T21:00:00")
         client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
 
-        run_sync(db, client)
+        log = run_sync(db, client)
 
         client.fetch_lineups.assert_not_called()
+        # Matchen ska hoppas över med flit. Utan den här raden kan ett fel inne
+        # i skippvillkoret se ut som ett lyckat överhopp: undantaget fångas per
+        # match och blir en varning, och lineups hämtas ändå inte.
+        assert log.warnings == []
 
     def test_spelad_utan_appearances_hamtar_lineups(self, db, monkeypatch):
         monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
@@ -945,8 +958,10 @@ class TestAppearanceStats:
         m = self._played_match(5004)
         client = build_client(team_a_dict=make_team_dict(TEAM_A_ID, [m]))
 
-        assert run_sync(db, client).ok is True
+        log = run_sync(db, client)
+        assert log.ok is True
         client.fetch_lineups.assert_not_called()
+        assert log.warnings == []
 
     def test_statistik_hamtad_mitt_i_matchen_hamtas_om_efter_slutrapport(
         self, db, monkeypatch
@@ -1721,3 +1736,228 @@ class TestPruneAppearances:
 
         assert _prune_appearances(db, 3001, {1}) == 1
         assert db.get(Appearance, (3002, 2)) is not None
+
+
+def nyligen(days: float) -> str:
+    """iBIS-tidssträng för en match som spelades `days` dygn tillbaka."""
+    return (_now_naive() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+class TestOmhamtningsfonstret:
+    """
+    Enhetstester för _within_resync_window (SPEC 3.5).
+
+    Klockan fryses, så gränsen går att testa på sekunden. Fönstret är inklusive:
+    exakt på dygnsgränsen ligger matchen kvar i fönstret, precis som
+    sjudagarsregeln för kommande matcher.
+    """
+
+    NU = datetime(2026, 10, 1, 12, 0, 0)
+
+    @pytest.fixture(autouse=True)
+    def _frys_klockan(self, monkeypatch):
+        monkeypatch.setattr("app.sync._now_naive", lambda: self.NU)
+
+    def _fonster(self, monkeypatch, dagar: int) -> None:
+        monkeypatch.setattr(
+            "app.sync.settings",
+            SimpleNamespace(
+                season_id=44, team_a_id=TEAM_A_ID, team_b_id=TEAM_B_ID,
+                resync_window_days=dagar,
+            ),
+        )
+
+    def test_tva_dygn_sedan_ar_inom(self, monkeypatch):
+        self._fonster(monkeypatch, 3)
+        assert _within_resync_window(self.NU - timedelta(days=2)) is True
+
+    def test_fem_dygn_sedan_ar_utanfor(self, monkeypatch):
+        self._fonster(monkeypatch, 3)
+        assert _within_resync_window(self.NU - timedelta(days=5)) is False
+
+    def test_exakt_tre_dygn_ar_inom(self, monkeypatch):
+        self._fonster(monkeypatch, 3)
+        assert _within_resync_window(self.NU - timedelta(days=3)) is True
+
+    def test_en_sekund_efter_tre_dygn_ar_utanfor(self, monkeypatch):
+        self._fonster(monkeypatch, 3)
+        kickoff = self.NU - timedelta(days=3, seconds=1)
+        assert _within_resync_window(kickoff) is False
+
+    def test_kommande_match_ar_inom(self, monkeypatch):
+        """Negativ ålder: matchen har inte spelats än och ska alltid hämtas."""
+        self._fonster(monkeypatch, 3)
+        assert _within_resync_window(self.NU + timedelta(days=1)) is True
+
+    def test_noll_dygn_stanger_av_fonstret(self, monkeypatch):
+        self._fonster(monkeypatch, 0)
+        assert _within_resync_window(self.NU) is False
+        assert _within_resync_window(self.NU - timedelta(hours=1)) is False
+
+    def test_konfigurerat_antal_dygn_styr_granserna(self, monkeypatch):
+        self._fonster(monkeypatch, 7)
+        assert _within_resync_window(self.NU - timedelta(days=5)) is True
+        assert _within_resync_window(self.NU - timedelta(days=8)) is False
+
+    def test_riktiga_konfigurationen_har_ett_standardvarde(self):
+        from app.config import Settings
+
+        assert Settings.model_fields["resync_window_days"].default == 3
+
+
+class TestFardigrapporteradMatchIFonstret:
+    """
+    En färdigrapporterad match hämtas om så länge den ligger i fönstret, så att
+    rättelser i trupp och resultat fångas utan att någon kör refresh_match.
+
+    Kickoff sätts relativt den riktiga klockan med marginal, så inget test
+    hamnar på gränsen. Gränsen i sig testas i TestOmhamtningsfonstret.
+    """
+
+    def _sync(self, db, m, lineups, *, events=None):
+        client = build_client(
+            team_a_dict=make_team_dict(TEAM_A_ID, [m]),
+            lineups_by_id={m["MatchID"]: lineups},
+            events_by_id=events,
+        )
+        log = run_sync(db, client)
+        assert log.ok is True
+        return client, log
+
+    def _match(self, match_id, dygn_sedan):
+        kickoff = nyligen(dygn_sedan)
+        return make_match_dict(
+            match_id, match_datetime=kickoff,
+            goals_home=2, goals_away=3,
+            final_result_ts=kickoff,
+        )
+
+    def test_tva_dygn_sedan_hamtas_om(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._match(4001, 2)
+        lineups = make_lineups_dict(4001, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        self._sync(db, m, lineups)
+        assert db.get(Match, 4001).stats_final_ts == m["FinalResultCreatedTS"]
+
+        # Andra synken: stämpeln stämmer, men matchen ligger i fönstret.
+        client, _ = self._sync(db, m, lineups)
+        client.fetch_lineups.assert_called_once_with(4001)
+
+    def test_fem_dygn_sedan_hoppas_over(self, db, monkeypatch):
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._match(4002, 5)
+        lineups = make_lineups_dict(4002, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        self._sync(db, m, lineups)
+
+        client, log = self._sync(db, m, lineups)
+        client.fetch_lineups.assert_not_called()
+        # Inga varningar: matchen hoppades över med flit, inte på ett fel.
+        assert log.warnings == []
+
+    def test_borttagen_dagen_efter_matchen_forsvinner_automatiskt(
+        self, db, monkeypatch
+    ):
+        """
+        Hela poängen med fönstret. Ingen refresh_match, ingen manuell
+        nollställning – bara två vanliga synkar.
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._match(4003, 1)
+        full = make_lineups_dict(4003, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+            make_player_dict(77, "William Lindahl", "22"),
+        ])
+        self._sync(db, m, full)
+        assert db.get(Appearance, (4003, 77)) is not None
+
+        # Dagen efter matchen plockar sekretariatet bort honom ur truppen.
+        utan = make_lineups_dict(4003, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        _client, log = self._sync(db, m, utan)
+
+        assert db.get(Appearance, (4003, 77)) is None
+        assert db.get(Appearance, (4003, 42)) is not None
+        assert db.get(Player, 77) is not None
+        assert any("borttagen ur matchtruppen" in w for w in log.warnings)
+
+    def test_rattat_resultat_i_fonstret_skriver_om_statistiken(
+        self, db, monkeypatch
+    ):
+        """Samma fönster fångar en rättad målskytt, inte bara truppen."""
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._match(4004, 1)
+        lineups = make_lineups_dict(4004, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        self._sync(db, m, lineups,
+                   events={4004: [make_event_dict(1, 1, 2, 42)]})
+        assert db.get(Appearance, (4004, 42)).goals == 1
+
+        # Målet skrivs om till en annan spelare.
+        self._sync(db, m, lineups,
+                   events={4004: [make_event_dict(1, 1, 2, 99)]})
+        assert db.get(Appearance, (4004, 42)).goals == 0
+
+    def test_utanfor_fonstret_fryser_underlaget(self, db, monkeypatch):
+        """Motsatsen: efter fönstret slår en borttagning inte igenom."""
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = self._match(4005, 5)
+        full = make_lineups_dict(4005, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+            make_player_dict(77, "William Lindahl", "22"),
+        ])
+        self._sync(db, m, full)
+
+        utan = make_lineups_dict(4005, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        self._sync(db, m, utan)
+
+        # Kvar – och det är refresh_match som är vägen vidare.
+        assert db.get(Appearance, (4005, 77)) is not None
+
+    def test_noll_dygn_i_konfigurationen_stanger_av_fonstret(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "app.sync.settings",
+            SimpleNamespace(
+                season_id=44, team_a_id=TEAM_A_ID, team_b_id=TEAM_B_ID,
+                resync_window_days=0,
+            ),
+        )
+
+        m = self._match(4006, 1)
+        lineups = make_lineups_dict(4006, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        self._sync(db, m, lineups)
+
+        client, _ = self._sync(db, m, lineups)
+        client.fetch_lineups.assert_not_called()
+
+    def test_ospelad_match_i_fonstret_paverkas_inte(self, db, monkeypatch):
+        """
+        Fönstret gäller bara det färdigrapporterade fallet. En ospelad match
+        hämtas om som förut, utan att stämpeln spelar in.
+        """
+        monkeypatch.setattr("app.sync.settings", MOCK_SETTINGS)
+
+        m = make_match_dict(4007, match_datetime=soon(2))
+        lineups = make_lineups_dict(4007, away_players=[
+            make_player_dict(42, "Kalle", "7"),
+        ])
+        self._sync(db, m, lineups)
+
+        client, _ = self._sync(db, m, lineups)
+        client.fetch_lineups.assert_called_once_with(4007)
