@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { UNLOCK_AFTER, unlockProgressText, showUnlockProgress } from '../lib/unlock.js'
 
 const LOCK_REASON_HUMAN = {
   'spelade A-match innan nagon B-match': 'Spelade A-match innan B',
@@ -85,6 +86,25 @@ function buildBadge(player, variant) {
   }
 }
 
+function UnlockProgress({ overstadda }) {
+  const n = overstadda ?? 0
+  return (
+    <div className="flex items-center gap-1.5 mt-1">
+      <span className="flex gap-0.5" aria-hidden="true">
+        {Array.from({ length: UNLOCK_AFTER }, (_, i) => (
+          <span
+            key={i}
+            className={`w-2 h-2 rounded-full ${
+              i < n ? 'bg-gray-500' : 'border border-gray-300'
+            }`}
+          />
+        ))}
+      </span>
+      <span className="text-xs text-gray-500">{unlockProgressText(n)}</span>
+    </div>
+  )
+}
+
 export default function PlayerRow({ player, variant, editMode, onOverride, onReset }) {
   const [pendingKind, setPendingKind] = useState(null)
   const [pendingValue, setPendingValue] = useState(null)
@@ -144,6 +164,11 @@ export default function PlayerRow({ player, variant, editMode, onOverride, onRes
           {/* Underlag */}
           {underlag && (
             <p className="text-xs text-gray-400 mt-0.5 pr-1">{underlag}</p>
+          )}
+
+          {/* Väg mot upplåsning – tre överstådda A-matcher i rad (SPEC 1) */}
+          {isLocked && showUnlockProgress(player) && (
+            <UnlockProgress overstadda={player.overstadda_a} />
           )}
 
           {/* Override info – alltid synlig när override finns */}

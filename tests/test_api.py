@@ -317,6 +317,33 @@ class TestGetStatus:
         row = data["grupper"]["tillgangliga"][0]
         assert 2 in row["a_match_ids"]
 
+    def test_last_spelare_visar_overstadda_a(self, db, api_client):
+        add_match(db, 1, "A", datetime(2020, 1, 1))
+        add_match(db, 2, "A", datetime(2020, 1, 10))
+        add_match(db, 3, "A", datetime(2020, 1, 20))
+        add_player(db, 55, "Erik", "10")
+        add_appearance(db, 1, 55, "Erik")
+        db.flush()
+
+        data = api_client.get("/api/status").json()
+
+        row = data["grupper"]["lasta"][0]
+        assert row["overstadda_a"] == 2
+
+    def test_upplast_spelare_maste_spela_b_forst(self, db, api_client):
+        for mid, day in ((1, 1), (2, 10), (3, 20), (4, 28)):
+            add_match(db, mid, "A", datetime(2020, 1, day))
+        add_player(db, 55, "Erik", "10")
+        add_appearance(db, 1, 55, "Erik")
+        db.flush()
+
+        data = api_client.get("/api/status").json()
+
+        assert data["rakningar"]["lasta"] == 0
+        row = data["grupper"]["tillgangliga"][0]
+        assert row["maste_spela_b_forst"] is True
+        assert row["matcher_kvar"] == 2
+
 
 # ---------------------------------------------------------------------------
 # GET /api/status?team= – lagfilter

@@ -7,6 +7,10 @@ Tva regler:
   2. Kedja: max 2 A-lagsmatcher i rad. Den tredje i rad laser spelaren.
      Kedjan nollstalls bara av att sta over en A-match. B-matcher paverkar inte.
 
+Upplasning: en last spelare lases upp nar han statt over 3 A-matcher i rad,
+raknat fran hans senaste A-match. Han atergar da till ursprungslaget och
+maste spela en B-match innan nasta A-match. Kan ske flera ganger per sasong.
+
 Instalda matcher hoppas over helt.
 Rakningen sker pa faktiskt speldatum, inte omgangsnummer.
 """
@@ -16,6 +20,7 @@ from datetime import datetime
 from enum import Enum
 
 MAX_CONSECUTIVE_A = 2  # den (MAX + 1):e matchen i rad laser
+UNLOCK_AFTER_SKIPPED_A = 3  # sa manga overstadda A-matcher i rad laser upp
 
 
 class Team(Enum):
@@ -60,6 +65,7 @@ class PlayerStatus:
     lock_date: datetime | None = None
     consecutive_a: int = 0
     has_b_appearance: bool = False
+    skipped_a: int = 0  # overstadda A-matcher i rad medan last
     a_match_ids: list[int] = field(default_factory=list)
     b_match_ids: list[int] = field(default_factory=list)
 
@@ -157,6 +163,19 @@ def compute_statuses(
 
         for st in statuses.values():
             if st.locked:
+                if st.player_id in in_squad:
+                    st.skipped_a = 0
+                    continue
+                st.skipped_a += 1
+                if st.skipped_a >= UNLOCK_AFTER_SKIPPED_A:
+                    # Tillbaka till ursprungslaget: kvalificeringen galler igen.
+                    st.locked = False
+                    st.lock_reason = None
+                    st.lock_match_id = None
+                    st.lock_date = None
+                    st.consecutive_a = 0
+                    st.has_b_appearance = False
+                    st.skipped_a = 0
                 continue
 
             if st.player_id not in in_squad:

@@ -223,3 +223,109 @@ def test_spelare_utan_matcher_finns_inte():
     matches = [m(1, Team.A, 0), m(2, Team.B, 7)]
     st = run(matches, [a(1, 100)])
     assert 999 not in st
+
+
+# --- Upplasning -------------------------------------------------------------
+
+def _last_i_match_2():
+    """Spelaren ar last i match 2 (A utan B forst) och star sedan over."""
+    return [m(1, Team.B, 0), m(2, Team.A, 7)], [a(2, 100)]
+
+
+def test_last_star_over_tva_ar_fortfarande_last():
+    matches, apps = _last_i_match_2()
+    matches += [m(3, Team.A, 14), m(4, Team.A, 21)]
+    st = run(matches, apps)
+    assert st[100].locked
+    assert st[100].skipped_a == 2
+
+
+def test_last_star_over_tre_lases_upp():
+    matches, apps = _last_i_match_2()
+    matches += [m(3, Team.A, 14), m(4, Team.A, 21), m(5, Team.A, 28)]
+    st = run(matches, apps)
+    assert not st[100].locked
+    assert st[100].lock_reason is None
+    assert not st[100].has_b_appearance  # maste spela B forst
+    assert st[100].skipped_a == 0
+
+
+def test_upplast_spelar_a_direkt_lases_igen():
+    matches, apps = _last_i_match_2()
+    matches += [m(3, Team.A, 14), m(4, Team.A, 21), m(5, Team.A, 28), m(6, Team.A, 35)]
+    apps += [a(6, 100)]
+    st = run(matches, apps)
+    assert st[100].locked
+    assert st[100].lock_reason is LockReason.NO_B_MATCH_FIRST
+    assert st[100].lock_match_id == 6
+
+
+def test_upplast_spelar_b_forst_kvalificerad_med_tva_kvar():
+    matches, apps = _last_i_match_2()
+    matches += [m(3, Team.A, 14), m(4, Team.A, 21), m(5, Team.A, 28), m(6, Team.B, 32)]
+    apps += [a(6, 100)]
+    st = run(matches, apps)
+    assert not st[100].locked
+    assert st[100].has_b_appearance
+    assert st[100].matches_left == 2
+
+
+def test_rakningen_utgar_fran_senaste_a_matchen():
+    """Last i match 2, spelar A i match 3 - raknas fran 3, inte 2."""
+    matches, apps = _last_i_match_2()
+    matches += [m(3, Team.A, 14), m(4, Team.A, 21), m(5, Team.A, 28)]
+    apps += [a(3, 100)]
+    st = run(matches, apps)
+    assert st[100].locked, "tre A-matcher sedan lasningen men bara tva overstadda"
+    assert st[100].skipped_a == 2
+
+    matches += [m(6, Team.A, 35)]
+    st = run(matches, apps)
+    assert not st[100].locked
+
+
+def test_last_och_upplast_tva_ganger():
+    matches = [
+        m(1, Team.B, 0),
+        m(2, Team.A, 7),                                  # last (ingen B forst)
+        m(3, Team.A, 14), m(4, Team.A, 21), m(5, Team.A, 28),  # star over -> upp
+        m(6, Team.B, 32),                                 # kvalificerar
+        m(7, Team.A, 35), m(8, Team.A, 42), m(9, Team.A, 49),  # tre i rad -> last
+        m(10, Team.A, 56), m(11, Team.A, 63), m(12, Team.A, 70),  # star over -> upp
+    ]
+    apps = [a(2, 100), a(6, 100), a(7, 100), a(8, 100), a(9, 100)]
+
+    st = run(matches[:9], apps)
+    assert st[100].locked
+    assert st[100].lock_reason is LockReason.THREE_IN_A_ROW
+
+    st = run(matches, apps)
+    assert not st[100].locked
+    assert not st[100].has_b_appearance
+
+
+def test_installd_match_raknas_inte_som_overstadd():
+    matches, apps = _last_i_match_2()
+    matches += [
+        m(3, Team.A, 14), m(4, Team.A, 21, MatchStatus.CANCELLED), m(5, Team.A, 28),
+    ]
+    st = run(matches, apps)
+    assert st[100].locked
+    assert st[100].skipped_a == 2
+
+
+def test_b_matcher_paverkar_inte_upplasningen():
+    matches, apps = _last_i_match_2()
+    matches += [
+        m(3, Team.A, 14), m(4, Team.B, 18), m(5, Team.A, 21),
+        m(6, Team.B, 25), m(7, Team.B, 26),
+    ]
+    apps += [a(4, 100), a(6, 100)]
+    st = run(matches, apps)
+    assert st[100].locked, "B-matcher ska varken rakna som overstadda eller nollstalla"
+    assert st[100].skipped_a == 2
+
+    matches += [m(8, Team.A, 28)]
+    st = run(matches, apps)
+    assert not st[100].locked
+    assert not st[100].has_b_appearance, "B-match under lasningen kvalificerar inte"

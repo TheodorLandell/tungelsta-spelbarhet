@@ -277,7 +277,10 @@ def _build_status_response(db: Session) -> dict[str, Any]:
             return (
                 None
                 if s is None
-                else (s.locked, s.lock_reason, s.matches_left, s.consecutive_a)
+                else (
+                    s.locked, s.lock_reason, s.matches_left, s.consecutive_a,
+                    s.skipped_a,
+                )
             )
 
         for pid in roster_edits_by_player:
@@ -327,10 +330,13 @@ def _build_status_response(db: Session) -> dict[str, Any]:
             "trojnummer": p.shirt_no if p else None,
             "matcher_kvar": matcher_kvar,
             "consecutive_a": s.consecutive_a,
+            # Överstådda A-matcher i rad mot upplåsningen, bara meningsfull när låst.
+            "overstadda_a": s.skipped_a,
             "a_match_ids": list(s.a_match_ids),
             "b_match_ids": list(s.b_match_ids),
             "lag": sorted(teams_by_player.get(s.player_id, [])),
-            "maste_spela_b_forst": False,
+            # Upplåst efter tre överstådda A-matcher: kvalificeringen gäller igen.
+            "maste_spela_b_forst": not s.locked and not s.has_b_appearance,
             "lock_orsak": lock_orsak,
             "lock_datum": lock_datum,
             "override": _override_info(ovr, latest_kickoff) if ovr else None,
@@ -360,6 +366,7 @@ def _build_status_response(db: Session) -> dict[str, Any]:
                 "trojnummer": p.shirt_no,
                 "matcher_kvar": matcher_kvar,
                 "consecutive_a": 0,
+                "overstadda_a": 0,
                 "a_match_ids": [],
                 "b_match_ids": [],
                 "lag": sorted(teams_by_player.get(pid, [])),

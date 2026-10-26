@@ -26,6 +26,22 @@ första A-lagsmatch. Gör han sin första match i A-laget blir han låst direkt.
 Kedjan nollställs endast av att spelaren står över en A-match, alltså inte finns med
 i matchtruppen. Att spela en B-match emellan bryter *inte* kedjan.
 
+**Upplåsning.** En låst spelare låses upp när han stått över **tre A-matcher i
+rad**. Räkningen utgår från hans senaste A-match, inte från låsningstillfället:
+blev han låst i match 10 och det var hans sista A-match är han fri inför match 14,
+efter att ha stått över 11, 12 och 13. Spelar han en A-match medan han är låst
+börjar räkningen om. Bara A-matcher räknas – B-matcher varken ökar eller
+nollställer räkningen.
+
+Efter upplåsningen är spelaren tillbaka i ursprungsläget, och
+kvalificeringsregeln gäller på nytt. En B-match som spelats medan han var låst
+räknas inte:
+
+- Spelar han A innan någon B-match blir han låst igen direkt
+- Spelar han en B-match först är han kvalificerad och har två A-matcher kvar
+
+En spelare kan låsas och låsas upp flera gånger under samma säsong.
+
 Detaljer som spelar roll:
 
 - "Spelat en match" betyder **uppskriven i matchtruppen**, inte tid på plan.
@@ -33,7 +49,8 @@ Detaljer som spelar roll:
 - Kedjan räknas i **speldatumordning**, inte omgångsnummer. En uppskjuten match
   hamnar där den faktiskt spelades.
 - Inställda matcher hoppas över helt. De varken ökar eller nollställer kedjan.
-- När en spelare är låst slutar all räkning. Han visas bara som låst.
+- När en spelare är låst räknas bara överstådda A-matcher mot upplåsningen.
+  Kedjan och kvalificeringen räknas inte förrän han låsts upp.
 - Reglerna gäller likadant hela säsongen. Inga undantag för målvakter.
 - C-laget (Herrar Division 5 Sydvästra) omfattas inte och ska ignoreras.
 
